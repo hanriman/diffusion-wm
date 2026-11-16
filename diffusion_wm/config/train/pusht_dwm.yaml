@@ -1,0 +1,8 @@
+# Push-T: Flat Diffusion World Model (SD-VAE + Rectified Flow DiT)
+defaults:
+  - base/pusht
+  - _self_
+
+output_model_name: pusht_dwm
+planning_eval:
+  config_name: pusht_gd

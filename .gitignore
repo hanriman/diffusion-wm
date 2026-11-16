@@ -1,0 +1,23 @@
+scratch/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# downloaded / generated eval tasks (687 MB; fetched via scripts/download_eval_trajs.sh)
+diffusion_wm/assets/
+
+# run outputs & caches
+experiments/
+outputs/
+multirun/
+lightning_logs/
+wandb/
+data_cache/
+ckpts/
+
+# local environment dumps
+environment*.json
+requirements_frozen*.txt

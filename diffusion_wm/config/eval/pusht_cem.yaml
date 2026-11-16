@@ -1,0 +1,63 @@
+# Push-T: Flat planning evaluation with CEMSolver (gradient-free sampling)
+cache_dir: ${oc.env:HJEPA_HOME,${oc.env:HOME}/.stable_worldmodel}
+world:
+  env_name: swm/PushT-v1
+  num_envs: ${eval.num_eval}
+  max_episode_steps: ???
+  history_size: 1
+  frame_skip: 1
+dataset:
+  stats: pusht_expert_train
+  keys_to_cache:
+    - action
+    - proprio
+    - state
+  level1:
+    frameskip: 1
+    num_steps: 1
+seed: 42
+policy: null
+dump_eval_trajs_path: null
+load_eval_trajs_path: assets/eval_trajs/pusht/goal_offset_75_val.pt
+model_overrides:
+  num_ode_steps: 4
+  ode_solver: euler
+  rollout_mode: parallel
+  rollout_noise_scale: 0.0
+solver:
+  _target_: stable_worldmodel.solver.CEMSolver
+  model: ???
+  n_steps: 5
+  num_samples: 256
+  num_elites: 32
+  var_scale: 1.0
+  min_std: 0.05
+  momentum: 0.1
+  temperature: null
+  action_clip_sigma: 3.0
+  batch_size: 1
+  device: cuda
+  seed: ${seed}
+plan_config:
+  horizon: 15
+  receding_horizon: 2
+  action_block: 5
+  cost_last_n: 2
+eval:
+  num_eval: 50
+  chunk_size: 1
+  goal_offset_steps: 75
+  eval_budget: 90
+  img_size: 224
+  dataset_name: pusht_expert_train
+  callables:
+    - method: _set_state
+      args:
+        state:
+          value: state
+    - method: _set_goal_state
+      args:
+        goal_state:
+          value: goal_state
+output:
+  dir: null

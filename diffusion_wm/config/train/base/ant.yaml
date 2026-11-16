@@ -1,0 +1,99 @@
+# @package _global_
+# Visual AntMaze base configuration for Diffusion World Model
+data:
+  dataset:
+    name: visual_antmaze_medium_explore_stitch_train
+    subset_seed: ${seed}
+    val_name: visual_antmaze_medium_stitch_val
+    val_total_transitions: 201000
+    keys_to_load:
+      - pixels
+      - action
+      - xy
+      - qpos
+      - qvel
+      - proprio
+    keys_to_cache:
+      - action
+      - xy
+      - qpos
+      - qvel
+    keys_to_merge:
+      proprio:
+        - key: qpos
+          start: 2
+        - qvel
+    level1:
+      frameskip: 5
+      num_steps: 4
+output_model_name: ant_dwm
+env: ant
+subdir: ${env}/${output_model_name}/seed${seed}
+cache_dir: null
+run_dir: null
+hydra:
+  run:
+    dir: ${oc.env:HJEPA_HOME,${oc.env:HOME}/.stable_worldmodel}/ckpts/${subdir}/hydra
+seed: 42
+img_size: 64
+num_workers: 6
+dump_object: true
+save_every_n_epochs: 1
+enable_logger: true
+trainer:
+  max_epochs: 5
+  devices: auto
+  accelerator: gpu
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  num_sanity_val_steps: 1
+loader:
+  batch_size: 128
+  num_workers: ${num_workers}
+  drop_last: true
+  persistent_workers: true
+  prefetch_factor: 2
+  pin_memory: true
+  shuffle: true
+optimizer:
+  lr: 1.0e-04
+  weight_decay: 0.001
+  warmup_ratio: 0.05
+vae:
+  type: sd_vae
+  pretrained_model_name_or_path: stabilityai/sd-vae-ft-mse
+  scaling_factor: 0.18215
+  freeze: true
+  use_posterior_mean: true
+  encode_batch_size: 64
+  input_is_imagenet_normalized: true
+wm:
+  history_size: 3
+  rollout_n: 1
+  action_dim: 8
+  action_embed_dim: 384
+  use_proprio: true
+  proprio_dim: 27
+  proprio_loss_weight: 1.0
+  proprio_cost_weight: 1.0
+  ctx_noise_std: 0.05
+  num_ode_steps: 4
+  ode_solver: euler
+  rollout_mode: parallel
+  rollout_noise_scale: 0.0
+  action_queue_size: 0
+dit:
+  patch_size: 1
+  hidden_dim: 384
+  depth: 6
+  heads: 6
+  dim_head: 64
+  mlp_ratio: 4.0
+  dropout: 0.0
+  max_seq_len: 32
+planning_eval:
+  enabled: true
+  config_name: ant_gd
+  output_subdir: planning_eval
+  run_on_train_end: true
+  every_n_epochs: 0

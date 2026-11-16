@@ -1,0 +1,8 @@
+# Visual AntMaze: Flat Diffusion World Model (SD-VAE + Proprio + Rectified Flow DiT)
+defaults:
+  - base/ant
+  - _self_
+
+output_model_name: ant_dwm
+planning_eval:
+  config_name: ant_gd
