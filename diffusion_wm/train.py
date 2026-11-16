@@ -10,6 +10,7 @@ import hydra
 import lightning as pl
 import torch
 import torch.nn.functional as F
+from lightning.pytorch.loggers import CSVLogger
 from loguru import logger as logging
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -264,12 +265,17 @@ def train_from_config(cfg: DictConfig) -> DiffusionWorldModelLightningModule:
         trainer_cfg['devices'] = 1
         trainer_cfg['precision'] = '32-true'
 
+    logger = (
+        CSVLogger(save_dir=str(run_dir), name='lightning_logs')
+        if cfg.get('enable_logger', True)
+        else False
+    )
     pl_module = DiffusionWorldModelLightningModule(model=model, cfg=cfg)
     trainer = pl.Trainer(
         **trainer_cfg,
         default_root_dir=str(run_dir),
         callbacks=callbacks,
-        logger=bool(cfg.get('enable_logger', True)),
+        logger=logger,
         enable_checkpointing=False,
     )
     trainer.fit(pl_module, train_dataloaders=train_loader, val_dataloaders=val_loader)
