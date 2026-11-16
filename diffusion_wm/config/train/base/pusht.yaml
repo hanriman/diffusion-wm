@@ -4,6 +4,7 @@ data:
   dataset:
     name: pusht_expert_train
     val_name: pusht_expert_val
+    total_transitions: null
     keys_to_load:
       - pixels
       - action
@@ -37,6 +38,8 @@ trainer:
   precision: bf16-mixed
   gradient_clip_val: 1.0
   num_sanity_val_steps: 1
+  limit_train_batches: null
+  limit_val_batches: null
 loader:
   batch_size: 64
   num_workers: ${num_workers}
