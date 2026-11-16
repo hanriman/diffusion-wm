@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import h5py
+import hdf5plugin  # noqa: F401
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -39,7 +40,8 @@ def precompute_vae_latents(
         if 'pixels' not in f:
             raise KeyError(f"'pixels' dataset not found in {path}")
         if 'vae_latents' in f:
-            if not overwrite:
+            is_complete = bool(f['vae_latents'].attrs.get('complete', False))
+            if is_complete and not overwrite:
                 print(
                     f"'vae_latents' already exists in {path}. Pass --overwrite to recompute."
                 )
@@ -60,9 +62,10 @@ def precompute_vae_latents(
         lat_ds = f.create_dataset(
             'vae_latents',
             shape=lat_shape,
-            dtype='float32',
+            dtype='float16',
             chunks=(min(batch_size, n_total), 4, h // 8, w // 8),
         )
+        lat_ds.attrs['complete'] = False
 
         for start in tqdm(
             range(0, n_total, batch_size),
@@ -74,8 +77,10 @@ def precompute_vae_latents(
             if channel_last:
                 t_img = t_img.permute(0, 3, 1, 2).contiguous()
             with torch.no_grad():
-                latents = vae.encode(t_img).cpu().numpy()
+                latents = vae.encode(t_img).half().cpu().numpy()
             lat_ds[start:end] = latents
+
+        lat_ds.attrs['complete'] = True
 
 
 def main() -> None:
