@@ -6,6 +6,9 @@ import math
 import os
 from pathlib import Path
 
+if os.environ.get('MPLBACKEND', '').startswith('module://'):
+    os.environ['MPLBACKEND'] = 'Agg'
+
 import hydra
 import lightning as pl
 import torch

@@ -1,5 +1,10 @@
 """Hydra CLI entry point for standalone planning evaluation."""
 
+import os
+
+if os.environ.get('MPLBACKEND', '').startswith('module://'):
+    os.environ['MPLBACKEND'] = 'Agg'
+
 import hydra
 from omegaconf import DictConfig
 

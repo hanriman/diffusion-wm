@@ -1,3 +1,8 @@
+import os
+
+if os.environ.get('MPLBACKEND', '').startswith('module://'):
+    os.environ['MPLBACKEND'] = 'Agg'
+
 from .models import (
     DiffusionWorldModel,
     SDVAEWrapper,
