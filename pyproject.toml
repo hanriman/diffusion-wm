@@ -32,10 +32,6 @@ dependencies = [
     "matplotlib",
     "pillow",
     "imageio",
-]
-
-[project.optional-dependencies]
-env = [
     "mujoco==3.14.0",
     "dm_control==1.0.47",
     "pygame",
@@ -48,6 +44,9 @@ env = [
     "jax",
     "flax",
 ]
+
+[project.optional-dependencies]
+env = []
 
 [dependency-groups]
 dev = [
