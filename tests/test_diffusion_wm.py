@@ -286,3 +286,55 @@ def test_gradient_solver_and_cem_solver_reduce_cost():
             eval_info, cem_out['actions'].unsqueeze(1)
         ).squeeze(1)
     assert (cem_cost <= baseline_cost + 1e-5).all()
+
+
+@pytest.mark.parametrize('rollout_mode', ['parallel', 'autoregressive'])
+def test_chunked_checkpointed_rollout_matches_exact_gradients(
+    rollout_mode: str,
+):
+    torch.manual_seed(11)
+    model = _make_model(
+        img_size=64,
+        patch_size=2,
+        action_dim=2,
+        frameskip=5,
+        rollout_mode=rollout_mode,
+        num_ode_steps=3,
+    ).eval()
+
+    b, s, h_ctx, t_plan = 2, 3, 1, 4
+    info_base = {
+        'pixels': torch.randn(b, s, h_ctx, 3, 64, 64),
+        'goal': torch.randn(b, s, 1, 3, 64, 64),
+        'cost_last_n': 2,
+    }
+    acts_ref = torch.randn(b, s, t_plan, 10, requires_grad=True)
+    acts_chk = acts_ref.detach().clone().requires_grad_(True)
+
+    # Reference: unchunked, no gradient checkpointing
+    model.rollout_batch_size = None
+    model.grad_checkpoint_rollout = False
+    cost_ref = model.get_cost(dict(info_base), acts_ref)
+    cost_ref.sum().backward()
+
+    # Chunked (size=2 over b*s=6) + gradient checkpointing
+    model.rollout_batch_size = 2
+    model.grad_checkpoint_rollout = True
+    cost_chk = model.get_cost(dict(info_base), acts_chk)
+    cost_chk.sum().backward()
+
+    torch.testing.assert_close(cost_ref, cost_chk)
+    torch.testing.assert_close(acts_ref.grad, acts_chk.grad)
+
+    # Legacy checkpoint compatibility: missing attributes fallback cleanly
+    for attr in (
+        'rollout_batch_size',
+        'grad_checkpoint_rollout',
+        'eval_autocast',
+    ):
+        delattr(model, attr)
+    acts_legacy = acts_ref.detach().clone().requires_grad_(True)
+    cost_legacy = model.get_cost(dict(info_base), acts_legacy)
+    cost_legacy.sum().backward()
+    torch.testing.assert_close(cost_ref, cost_legacy)
+    torch.testing.assert_close(acts_ref.grad, acts_legacy.grad)

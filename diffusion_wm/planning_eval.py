@@ -193,6 +193,16 @@ def _build_eval_process_from_policy_normalizer(
     )
 
 
+def _eval_sdpa_kernel():
+    return sdpa_kernel(
+        [
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+        ]
+    )
+
+
 def _apply_model_overrides(model, cfg: DictConfig) -> None:
     overrides = cfg.get('model_overrides', None)
     if not overrides:
@@ -202,6 +212,9 @@ def _apply_model_overrides(model, cfg: DictConfig) -> None:
         'ode_solver',
         'rollout_mode',
         'rollout_noise_scale',
+        'rollout_batch_size',
+        'grad_checkpoint_rollout',
+        'eval_autocast',
         'proprio_cost_weight',
     ):
         if key in overrides and overrides[key] is not None:
@@ -364,7 +377,7 @@ def _run_chunked_eval(
         try:
             world.set_policy(policy)
             t0 = time.time()
-            with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH):
+            with torch.enable_grad(), _eval_sdpa_kernel():
                 metrics = world.evaluate_from_dataset(
                     None,
                     episodes_idx=None,
@@ -491,7 +504,7 @@ def run_planning_eval(
         world.set_policy(policy)
 
         start_time = time.time()
-        with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH):
+        with torch.enable_grad(), _eval_sdpa_kernel():
             callables = OmegaConf.to_container(
                 cfg.eval.get('callables'), resolve=True
             )

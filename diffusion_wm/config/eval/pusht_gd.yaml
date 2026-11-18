@@ -24,6 +24,9 @@ model_overrides:
   ode_solver: euler
   rollout_mode: parallel
   rollout_noise_scale: 0.0
+  rollout_batch_size: 8
+  grad_checkpoint_rollout: true
+  eval_autocast: true
 solver:
   _target_: stable_worldmodel.solver.GradientSolver
   model: ???

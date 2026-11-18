@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .dit import SpatioTemporalDiT
 from .vae import build_vae
@@ -13,6 +16,14 @@ from .vae import build_vae
 
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
+
+
+def _preferred_cuda_amp_dtype() -> torch.dtype:
+    try:
+        bf16_ok = torch.cuda.is_bf16_supported(including_emulation=False)
+    except TypeError:
+        bf16_ok = torch.cuda.is_bf16_supported()
+    return torch.bfloat16 if bf16_ok else torch.float16
 
 
 class DiffusionWorldModel(nn.Module):
@@ -41,6 +52,9 @@ class DiffusionWorldModel(nn.Module):
         ode_solver: str = 'euler',
         rollout_mode: str = 'parallel',
         rollout_noise_scale: float = 0.0,
+        rollout_batch_size: int | None = 8,
+        grad_checkpoint_rollout: bool = True,
+        eval_autocast: bool = True,
         action_queue_size: int = 0,
     ) -> None:
         super().__init__()
@@ -60,6 +74,11 @@ class DiffusionWorldModel(nn.Module):
         self.ode_solver = str(ode_solver).lower()
         self.rollout_mode = str(rollout_mode).lower()
         self.rollout_noise_scale = float(rollout_noise_scale)
+        self.rollout_batch_size = (
+            None if rollout_batch_size is None else max(1, int(rollout_batch_size))
+        )
+        self.grad_checkpoint_rollout = bool(grad_checkpoint_rollout)
+        self.eval_autocast = bool(eval_autocast)
         self.level = 1
         self.num_levels = 1
         self.interpolate_pos_encoding = True
@@ -309,6 +328,34 @@ class DiffusionWorldModel(nn.Module):
 
         return out
 
+    def _predict_velocity(
+        self,
+        z_vis_seq: torch.Tensor,
+        tau_seq: torch.Tensor,
+        act_emb_seq: torch.Tensor,
+        z_p_seq: torch.Tensor | None,
+        *,
+        checkpoint_blocks: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        use_amp = z_vis_seq.is_cuda and bool(getattr(self, 'eval_autocast', True))
+        ctx = (
+            torch.amp.autocast('cuda', dtype=_preferred_cuda_amp_dtype())
+            if use_amp
+            else nullcontext()
+        )
+        with ctx:
+            pred = self.dit(
+                z_vis_seq,
+                tau_seq,
+                act_emb_seq,
+                z_proprio=z_p_seq,
+                checkpoint_blocks=checkpoint_blocks,
+            )
+        out = {'v_vis': pred['v_vis'].to(dtype=z_vis_seq.dtype)}
+        if 'v_proprio' in pred and z_p_seq is not None:
+            out['v_proprio'] = pred['v_proprio'].to(dtype=z_p_seq.dtype)
+        return out
+
     def _ode_step(
         self,
         z_vis_seq: torch.Tensor,
@@ -317,9 +364,16 @@ class DiffusionWorldModel(nn.Module):
         act_emb_seq: torch.Tensor,
         dt: float,
         active_start: int,
+        checkpoint_blocks: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Perform one Euler or Midpoint ODE integration step on `[:, active_start:]`."""
-        pred = self.dit(z_vis_seq, tau_seq, act_emb_seq, z_proprio=z_p_seq)
+        pred = self._predict_velocity(
+            z_vis_seq,
+            tau_seq,
+            act_emb_seq,
+            z_p_seq,
+            checkpoint_blocks=checkpoint_blocks,
+        )
         v_vis = pred['v_vis'][:, active_start:]
         v_p = pred['v_proprio'][:, active_start:] if self.use_proprio else None
 
@@ -341,7 +395,13 @@ class DiffusionWorldModel(nn.Module):
             else:
                 z_p_mid = None
 
-            pred_mid = self.dit(z_vis_mid, tau_mid, act_emb_seq, z_proprio=z_p_mid)
+            pred_mid = self._predict_velocity(
+                z_vis_mid,
+                tau_mid,
+                act_emb_seq,
+                z_p_mid,
+                checkpoint_blocks=checkpoint_blocks,
+            )
             v_vis = pred_mid['v_vis'][:, active_start:]
             v_p = (
                 pred_mid['v_proprio'][:, active_start:]
@@ -359,6 +419,45 @@ class DiffusionWorldModel(nn.Module):
             z_p_next = None
 
         return z_vis_next, z_p_next
+
+    def _ode_step_maybe_ckpt(
+        self,
+        z_vis_seq: torch.Tensor,
+        z_p_seq: torch.Tensor | None,
+        tau_seq: torch.Tensor,
+        act_emb_seq: torch.Tensor,
+        *,
+        dt: float,
+        active_start: int,
+        use_ckpt: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if not use_ckpt:
+            return self._ode_step(
+                z_vis_seq,
+                z_p_seq,
+                tau_seq,
+                act_emb_seq,
+                dt=dt,
+                active_start=active_start,
+                checkpoint_blocks=False,
+            )
+        return checkpoint(
+            lambda zv, zp, ts, ae: self._ode_step(
+                zv,
+                zp,
+                ts,
+                ae,
+                dt=dt,
+                active_start=active_start,
+                checkpoint_blocks=True,
+            ),
+            z_vis_seq,
+            z_p_seq,
+            tau_seq,
+            act_emb_seq,
+            use_reentrant=False,
+            preserve_rng_state=self.training,
+        )
 
     def _init_future_noise(
         self, shape: tuple[int, ...], device: torch.device, dtype: torch.dtype
@@ -393,7 +492,6 @@ class DiffusionWorldModel(nn.Module):
         k_steps = max(1, int(num_ode_steps or self.num_ode_steps))
         n_batch, h_ctx, c, hp, wp = ctx_vis.shape
         t_plan = actions.size(1)
-        total_len = h_ctx + t_plan
         device = ctx_vis.device
         dtype = ctx_vis.dtype
 
@@ -418,18 +516,29 @@ class DiffusionWorldModel(nn.Module):
         act_emb_seq = torch.cat([null_ctx, fut_act_emb], dim=1)
 
         dt = 1.0 / float(k_steps)
-        tau_seq = torch.ones((n_batch, total_len), device=device, dtype=torch.float32)
+        use_ckpt = bool(getattr(self, 'grad_checkpoint_rollout', True)) and (
+            torch.is_grad_enabled()
+        )
 
         for step_idx in range(k_steps):
             t_val = float(step_idx) * dt
-            tau_seq[:, h_ctx:] = t_val
-            z_vis_seq, z_p_seq = self._ode_step(
+            tau_seq = torch.cat(
+                [
+                    torch.ones((n_batch, h_ctx), device=device, dtype=torch.float32),
+                    torch.full(
+                        (n_batch, t_plan), t_val, device=device, dtype=torch.float32
+                    ),
+                ],
+                dim=1,
+            )
+            z_vis_seq, z_p_seq = self._ode_step_maybe_ckpt(
                 z_vis_seq,
                 z_p_seq,
                 tau_seq,
                 act_emb_seq,
                 dt=dt,
                 active_start=h_ctx,
+                use_ckpt=use_ckpt,
             )
 
         return z_vis_seq, z_p_seq
@@ -456,6 +565,10 @@ class DiffusionWorldModel(nn.Module):
         act_emb_all = self.action_embed(actions.float())  # (N, T_plan, A_emb)
         past_act_embs = self.null_action_emb.expand(n_batch, ctx_vis.size(1), -1)
 
+        use_ckpt = bool(getattr(self, 'grad_checkpoint_rollout', True)) and (
+            torch.is_grad_enabled()
+        )
+
         for step_t in range(t_plan):
             win_vis = vis_traj[:, -hs:]
             win_len = win_vis.size(1)
@@ -477,18 +590,29 @@ class DiffusionWorldModel(nn.Module):
             next_act_emb = act_emb_all[:, step_t : step_t + 1]
             cur_act_emb = torch.cat([win_act_emb, next_act_emb], dim=1)
 
-            tau_seq = torch.ones(
-                (n_batch, win_len + 1), device=device, dtype=torch.float32
-            )
             for k in range(k_steps):
-                tau_seq[:, -1] = float(k) * dt
-                cur_vis_seq, cur_p_seq = self._ode_step(
+                tau_seq = torch.cat(
+                    [
+                        torch.ones(
+                            (n_batch, win_len), device=device, dtype=torch.float32
+                        ),
+                        torch.full(
+                            (n_batch, 1),
+                            float(k) * dt,
+                            device=device,
+                            dtype=torch.float32,
+                        ),
+                    ],
+                    dim=1,
+                )
+                cur_vis_seq, cur_p_seq = self._ode_step_maybe_ckpt(
                     cur_vis_seq,
                     cur_p_seq,
                     tau_seq,
                     cur_act_emb,
                     dt=dt,
                     active_start=win_len,
+                    use_ckpt=use_ckpt,
                 )
 
             vis_traj = torch.cat([vis_traj, cur_vis_seq[:, -1:]], dim=1)
@@ -547,19 +671,43 @@ class DiffusionWorldModel(nn.Module):
             else None
         )
 
-        if self.rollout_mode == 'autoregressive':
-            pred_vis, pred_p = self.sample_ode_autoregressive(
-                ctx_vis,
-                act_flat,
-                ctx_proprio=ctx_p,
-                history_size=history_size or self.history_size,
+        n_total = ctx_vis.size(0)
+        raw_chunk = getattr(self, 'rollout_batch_size', 8)
+        chunk_size = int(raw_chunk) if raw_chunk is not None and int(raw_chunk) > 0 else n_total
+
+        def _rollout_chunk(
+            c_vis: torch.Tensor, c_act: torch.Tensor, c_p: torch.Tensor | None
+        ) -> tuple[torch.Tensor, torch.Tensor | None]:
+            if self.rollout_mode == 'autoregressive':
+                return self.sample_ode_autoregressive(
+                    c_vis,
+                    c_act,
+                    ctx_proprio=c_p,
+                    history_size=history_size or self.history_size,
+                )
+            return self.sample_ode_parallel(
+                c_vis,
+                c_act,
+                ctx_proprio=c_p,
             )
+
+        if n_total <= chunk_size:
+            pred_vis, pred_p = _rollout_chunk(ctx_vis, act_flat, ctx_p)
         else:
-            pred_vis, pred_p = self.sample_ode_parallel(
-                ctx_vis,
-                act_flat,
-                ctx_proprio=ctx_p,
-            )
+            vis_chunks = []
+            p_chunks = []
+            for start in range(0, n_total, chunk_size):
+                end = min(start + chunk_size, n_total)
+                pv, pp = _rollout_chunk(
+                    ctx_vis[start:end],
+                    act_flat[start:end],
+                    ctx_p[start:end] if ctx_p is not None else None,
+                )
+                vis_chunks.append(pv)
+                if pp is not None:
+                    p_chunks.append(pp)
+            pred_vis = torch.cat(vis_chunks, dim=0)
+            pred_p = torch.cat(p_chunks, dim=0) if p_chunks else None
 
         info['predicted_embed_0'] = rearrange(
             pred_vis, '(b s) ... -> b s ...', b=b, s=s
@@ -685,5 +833,8 @@ def build_diffusion_world_model(cfg) -> DiffusionWorldModel:
         ode_solver=str(wm_cfg.get('ode_solver', 'euler')),
         rollout_mode=str(wm_cfg.get('rollout_mode', 'parallel')),
         rollout_noise_scale=float(wm_cfg.get('rollout_noise_scale', 0.0)),
+        rollout_batch_size=wm_cfg.get('rollout_batch_size', 8),
+        grad_checkpoint_rollout=bool(wm_cfg.get('grad_checkpoint_rollout', True)),
+        eval_autocast=bool(wm_cfg.get('eval_autocast', True)),
         action_queue_size=int(wm_cfg.get('action_queue_size', 0)),
     )

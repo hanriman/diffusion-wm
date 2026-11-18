@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class SinusoidalTimestepEmbedder(nn.Module):
@@ -330,6 +331,8 @@ class SpatioTemporalDiT(nn.Module):
         tau: torch.Tensor,
         act_emb: torch.Tensor,
         z_proprio: torch.Tensor | None = None,
+        *,
+        checkpoint_blocks: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Predict velocity fields `(v_vis, v_proprio)`.
 
@@ -338,6 +341,8 @@ class SpatioTemporalDiT(nn.Module):
             tau: Per-frame flow time in `[0, 1]` of shape `(B, T)`.
             act_emb: Per-frame action embeddings of shape `(B, T, act_emb_dim)`.
             z_proprio: Optional noisy proprioception of shape `(B, T, proprio_dim)`.
+            checkpoint_blocks: Recompute transformer blocks during backward to
+                reduce activation memory (e.g., during GradientSolver planning).
 
         Returns:
             Dictionary with `'v_vis'` `(B, T, C, H', W')` and optionally
@@ -365,8 +370,18 @@ class SpatioTemporalDiT(nn.Module):
 
         c = self.time_embedder(tau) + self.action_cond_proj(act_emb)  # (B, T, D)
 
+        use_ckpt = bool(checkpoint_blocks) and torch.is_grad_enabled()
         for block in self.blocks:
-            tokens = block(tokens, c)
+            if use_ckpt:
+                tokens = checkpoint(
+                    block,
+                    tokens,
+                    c,
+                    use_reentrant=False,
+                    preserve_rng_state=self.training,
+                )
+            else:
+                tokens = block(tokens, c)
 
         if self.use_proprio:
             vis_out_tokens = tokens[:, :, : self.num_vis_patches]
