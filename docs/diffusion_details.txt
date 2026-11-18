@@ -1,0 +1,101 @@
+DIFFUSION IN DETAIL: RECTIFIED FLOW + DIFFUSION FORCING
+======================================================
+
+This document explains the generative formulation used inside DiffusionWorldModel
+(diffusion_wm/models/diffusion_wm.py and diffusion_wm/models/dit.py).
+
+--------------------------------------------------------------------------------
+1. WHY DIFFUSION INSTEAD OF DIRECT MSE REGRESSION?
+--------------------------------------------------------------------------------
+Suppose we want to predict the next latent z_{t+1} from history z_{<=t} and action a_t.
+In real physics (e.g., when the circle grazes the corner of the T-block), small sub-pixel
+differences can lead to two valid outcomes: rotating slightly clockwise (z_A) or
+slightly counter-clockwise (z_B).
+
+  - Direct deterministic MSE regression predicts the conditional mean E[z_{t+1} | z_{<=t}, a_t],
+    which averages z_A and z_B into a blurry "ghost" frame. Over multi-step rollouts,
+    blur compounds rapidly.
+  - Diffusion / Flow Matching instead learns a vector field that transports samples along
+    a trajectory onto sharp, realistic data states.
+
+--------------------------------------------------------------------------------
+2. RECTIFIED FLOW (STRAIGHT-LINE FLOW MATCHING)
+--------------------------------------------------------------------------------
+Classical DDPM uses a curved stochastic noise schedule that requires 50 to 1,000 steps
+to denoise a sample — far too slow to run inside an MPC planning loop.
+
+Rectified Flow connects pure Gaussian noise (tau = 0) and clean data (tau = 1) along
+a STRAIGHT LINE:
+
+  Let:
+    eps ~ N(0, I)           pure Gaussian noise
+    z*                      clean latent encoded by the frozen SD-VAE
+    tau in [0, 1]           flow time (0 = pure noise, 1 = clean data)
+
+  Linear interpolation path:
+    z(tau) = (1 - tau) * eps + tau * z*
+
+  Check the endpoints:
+    - tau = 0  =>  z(0) = eps    (100% noise)
+    - tau = 1  =>  z(1) = z*     (100% clean latent)
+
+  Derivative with respect to flow time tau (the true velocity):
+    v* = dz(tau)/dtau = z* - eps
+
+  Notice v* is constant along the straight line from eps to z*.
+
+Training Objective (compute_loss):
+  1. Sample eps ~ N(0, I) and tau in [0, 1].
+  2. Construct noisy input z_noisy = (1 - tau) * eps + tau * z*.
+  3. Run SpatioTemporalDiT to predict velocity v_hat = DiT(z_noisy, tau, shifted_actions).
+  4. Minimize MSE against the true velocity (z* - eps):
+       L_RF = E[ || v_hat - (z* - eps) ||_2^2 ]
+     (On Visual AntMaze, the same interpolation and velocity MSE is applied jointly
+      to the 27-D proprioception vector p*: p(tau) = (1 - tau)*eps_p + tau*p*,
+      L_total = L_vis + proprio_loss_weight * L_proprio.)
+
+Why is it fast at test time?
+  Because the training paths are straight lines, solving the learned Ordinary Differential
+  Equation (ODE) dz/dtau = v_theta(z, tau) from tau = 0 -> 1 only needs K = 4 Euler steps
+  (dt = 1/4 = 0.25):
+    z_{k+1} = z_k + dt * v_theta(z_k, tau_k, context, actions)
+  (The model also supports 2nd-order Midpoint integration via `ode_solver="midpoint"`.)
+
+--------------------------------------------------------------------------------
+3. DIFFUSION FORCING (PER-FRAME NOISE LEVELS + CAUSAL ATTENTION)
+--------------------------------------------------------------------------------
+Standard video diffusion uses a SINGLE noise level tau shared across all frames in a clip.
+That does not match world modeling, where past frames are KNOWN (clean) and future frames
+are UNKNOWN (denoised from tau = 0 -> 1).
+
+Diffusion Forcing assigns each frame t its OWN flow time tau_t in [0, 1], paired with
+Causal Temporal Attention (is_causal=True, so frame t only attends to frames <= t):
+
+In `_sample_training_tau` (diffusion_wm/models/diffusion_wm.py):
+  - History frames (t < history_size=3):
+      tau_t ~ Uniform(1 - ctx_noise_std, 1.0) = [0.95, 1.0]
+      Adding a tiny 5% stabilization noise to context frames teaches the model not to break
+      when conditioned on slightly imperfect predicted frames during long rollouts.
+  - Future / Target frames:
+      * 50% of the batch uses SYNCHRONIZED tau across future frames:
+        teaches the model to denoise an entire multi-step future horizon simultaneously in
+        parallel (`rollout_mode="parallel"`).
+      * 50% of the batch uses INDEPENDENT tau_t per future frame:
+        teaches the model to predict step-by-step and handle varying uncertainty across time
+        (`rollout_mode="autoregressive"`).
+
+--------------------------------------------------------------------------------
+4. DIFFERENTIABLE PLANNING THROUGH THE DIFFUSION ODE (GradientSolver)
+--------------------------------------------------------------------------------
+Because sampling from tau = 0 -> 1 takes only K = 4 Euler steps of standard PyTorch tensor
+operations (Linear, LayerNorm, GELU, scaled_dot_product_attention, addition), the entire
+4-step rollout is end-to-end differentiable with respect to the candidate actions a_{1:H}:
+
+  1. Initialize candidate action sequence a_{1:H} (shape: B x S x H x act_dim).
+  2. Run K=4 Euler ODE steps -> predicted future latents z_pred (still attached to autograd!).
+  3. Compute goal cost: MSE(z_pred[:, :, -cost_last_n:], z_goal).
+  4. Call cost.backward() -> gradients flow backward through the 4 ODE steps directly into a_{1:H}.
+  5. Update a_{1:H} with AdamW for 40 inner optimization steps.
+
+Alternatively, CEMSolver / MPPI evaluates candidate action sequences under `torch.no_grad()`
+and updates a Gaussian sampling distribution using the top-k lowest-cost elites.

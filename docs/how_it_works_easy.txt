@@ -1,0 +1,89 @@
+HOW THE DIFFUSION WORLD MODEL WORKS (SLOW & EASY GUIDE)
+=======================================================
+
+Imagine you want to teach a robot to play Push-T (pushing a gray T-shaped block onto a
+target spot on a 2D table using a blue circle agent).
+
+In traditional Reinforcement Learning (RL), an agent learns a direct rule:
+  "Look at the screen -> immediately guess an action."
+That usually requires millions of trial-and-error interactions inside a simulator.
+
+A World Model takes a different approach:
+First, it learns a "mental physics simulator" from recorded gameplay videos. Then, at test
+time, it imagines what will happen for different action plans inside its head and picks
+the plan that reaches the goal.
+
+Our system has three simple pieces:
+  1. The Eyes    (Frozen SD-VAE, 83.7 M params, NOT trained by us)
+  2. The Brain   (Diffusion Transformer, 23.3 M params, TRAINED by us)
+  3. The Planner (MPC loop at test time)
+
+--------------------------------------------------------------------------------
+PART 1: THE EYES — Frozen SD-VAE (83.7 M params, NOT trained)
+--------------------------------------------------------------------------------
+A raw Push-T image is 224 x 224 pixels x 3 colors = 150,528 numbers per frame.
+Predicting 150,528 pixel values step-by-step is slow and wastes effort on textures.
+
+So we download a pretrained Stable Diffusion VAE (stabilityai/sd-vae-ft-mse):
+  - Encoder (~34 M params): shrinks each 224x224 image down 8x into a tiny 4x28x28 grid
+    (only 3,136 numbers — 48x smaller!), while keeping the exact positions of the blue
+    circle and the T-block.
+  - Decoder (~49 M params): turns a 4x28x28 grid back into a normal 224x224 image.
+    We NEVER run the decoder during training or planning — only at the end when making
+    GIFs and plots for your presentation!
+
+Why is the VAE not trained?
+  Because Stability AI already trained it on millions of images. It already knows how to
+  see shapes, edges, and colors. We lock (freeze) its weights so training focuses 100%
+  on Push-T physics.
+
+--------------------------------------------------------------------------------
+PART 2: THE BRAIN — Diffusion Transformer (23.3 M params, TRAINED by us)
+--------------------------------------------------------------------------------
+This 23.3 M parameter neural network (SpatioTemporalDiT) is the ONLY part we train.
+Its job is to learn physics:
+  "Given the last 3 shrunken frames and the push actions I took, what will the next
+   shrunken frame look like?"
+
+How is it trained? (Pure supervised learning — no simulator needed!)
+  1. Take a short 4-frame clip from the recorded Push-T dataset:
+       frame 0, frame 1, frame 2, frame 3   (each spaced 5 simulator steps apart)
+  2. Shrink all 4 frames with the frozen Eyes (VAE).
+  3. Keep frames 0, 1, 2 clean (this is the history/context).
+  4. Take the real answer (frame 3) and mix it with random noise (like TV static),
+     controlled by a noise slider tau between 0 (all noise) and 1 (clean frame).
+  5. Give [frame 0, frame 1, frame 2, noisy frame 3] + [the push actions] to our
+     23.3 M Brain and ask:
+       "Which direction moves noisy frame 3 back toward the clean frame 3?"
+  6. Measure MSE error between the Brain's predicted direction and the true direction,
+     run loss.backward(), and update the 23.3 M Brain weights using AdamW.
+
+That's it! Just standard deep learning: data -> forward pass -> MSE loss -> AdamW.
+
+--------------------------------------------------------------------------------
+PART 3: THE PLANNER — Playing Push-T with MPC (Test Time)
+--------------------------------------------------------------------------------
+Once the Brain is trained, we drop the agent into the real Push-T simulator and show it a
+Goal picture (where the T-block should end up).
+
+Every turn (every 10 raw simulator steps), the agent does:
+  1. LOOK: Shrink the current table image and the Goal image using the frozen Eyes.
+  2. IMAGINE: Propose ~64 candidate sequences of future push actions (looking 15 macro-steps
+     ahead). For each candidate, start from blank/noise future frames and run the trained
+     Brain for 4 quick denoising steps to "dream" the future table state.
+  3. SCORE & IMPROVE: Compare the end of each dream against the shrunken Goal image (MSE).
+     - GradientSolver backpropagates through the 4 dream steps to directly adjust the
+       candidate push actions using AdamW so the dream lands closer to the goal.
+     - (Or CEMSolver tries many random plans without gradients and keeps the best ones.)
+  4. ACT & REPLAN: Execute only the first 2 macro-actions (10 raw steps) in the real
+     Push-T game, take a fresh look at what actually happened, and replan from scratch.
+
+Replanning frequently ("Model Predictive Control", MPC) guarantees that small imagination
+errors never snowball over a 90-step episode.
+
+--------------------------------------------------------------------------------
+ONE-SENTENCE SUMMARY
+--------------------------------------------------------------------------------
+The frozen VAE (83.7 M) is the camera compressor, the trained Diffusion Transformer (23.3 M)
+is the learned physics simulator, and MPC uses that simulator to test action plans in its
+head before moving in the real world.

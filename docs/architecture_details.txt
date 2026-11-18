@@ -1,0 +1,77 @@
+DIFFUSION WORLD MODEL — ARCHITECTURE DETAILS
+==========================================
+
+Repository: diffusion-wm
+Environments:
+  - Push-T (swm/PushT-v1): 224x224 RGB pixels, 2D action (10-D stacked over frameskip=5)
+  - Visual AntMaze (swm/OGBAntMaze-v0): 64x64 RGB pixels + 27-D proprioception (qpos[2:], qvel),
+    8D action (40-D stacked over frameskip=5)
+
+--------------------------------------------------------------------------------
+1. PARAMETER BREAKDOWN (Push-T Example)
+--------------------------------------------------------------------------------
+  Total parameters         : ~106 M (107 M)
+  - Frozen (Non-trainable) :  83.7 M  -> SDVAEWrapper (stabilityai/sd-vae-ft-mse)
+      * Encoder (~34 M)    :  Runs under torch.no_grad() to compress RGB -> 4xH'xW' latents
+      * Decoder (~49 M)    :  NOT called during training or MPC cost; used only for visuals
+  - Trainable              :  23.3 M  -> DiffusionWorldModel dynamics (SpatioTemporalDiT + action_embed)
+
+Why freeze the SD-VAE?
+  stabilityai/sd-vae-ft-mse is already pretrained on millions of images to compress and
+  reconstruct visual scenes with high fidelity. Freezing it avoids representation collapse,
+  reduces VRAM/optimizer state, and lets the 23.3 M trainable network focus entirely on
+  action-conditioned environment physics and temporal dynamics.
+
+--------------------------------------------------------------------------------
+2. COMPONENT-BY-COMPONENT SPECIFICATION
+--------------------------------------------------------------------------------
+(A) SDVAEWrapper (diffusion_wm/models/vae.py)
+  - Input: ImageNet-normalized RGB tensor (B, T, 3, H, W)
+  - Preprocessing: un-normalizes ImageNet stats back to [-1, 1]
+  - Encoding: AutoencoderKL.encode(...).latent_dist.mode() * 0.18215
+      * Push-T (224x224)  -> (B, T, 4, 28, 28)
+      * AntMaze (64x64)   -> (B, T, 4, 8, 8)
+  - Decoding: AutoencoderKL.decode(z / 0.18215).sample -> [0, 1] RGB (visualization only)
+
+(B) Action Conditioning (diffusion_wm/models/diffusion_wm.py)
+  - Each step spans frameskip=5 raw simulator actions concatenated:
+      * Push-T  : action_dim=2  -> stacked_action_dim = 10
+      * AntMaze : action_dim=8  -> stacked_action_dim = 40
+  - action_embed: Linear(stacked_action_dim -> 384) -> SiLU -> Linear(384 -> 384)
+  - Temporal shift: Frame 0 uses learned `null_action_emb` (1, 1, 384);
+    frame t >= 1 uses `action_embed(a_{t-1})` (the action transitioning x_{t-1} -> x_t).
+
+(C) SpatioTemporalDiT (diffusion_wm/models/dit.py)
+  - Patchification:
+      * Push-T  (patch_size=2 on 4x28x28): 14x14 = 196 visual tokens, patch_dim = 4*2*2 = 16
+      * AntMaze (patch_size=1 on 4x8x8)  :  8x8  =  64 visual tokens, patch_dim = 4*1*1 = 4
+  - Proprioception Token (AntMaze only, use_proprio=True):
+      * Normalized 27-D proprio -> MLP(27 -> 384 -> 384) -> 1 token appended per frame
+      * Total tokens per frame on AntMaze = 64 + 1 = 65
+  - Positional Embeddings:
+      * Learnable 2D spatial_pos_embed: (1, 1, num_tokens, 384)
+      * Learnable 1D temporal_pos_embed: (1, max_seq_len=32, 1, 384)
+  - Per-frame Conditioning c_t (B, T, 384):
+      * c_t = SinusoidalTimestepEmbedder(tau_t) + action_cond_proj(act_emb_t)
+  - Transformer Backbone (depth=6, hidden_dim=384, heads=6, dim_head=64, mlp_ratio=4.0):
+      Each SpatioTemporalDiTBlock applies 3 AdaLN-Zero modulated sublayers:
+        1. Spatial Self-Attention   : Bidirectional attention across tokens within each frame
+                                      shape (B*T, N_tokens, 384)
+        2. Causal Temporal Attention: Causal attention (is_causal=True) across time per token
+                                      shape (B*N_tokens, T, 384)
+        3. Feed-Forward MLP         : Linear(384 -> 1536) -> GELU -> Linear(1536 -> 384)
+  - Output Heads (FinalAdaLNHead):
+      * vis_head     : LayerNorm + AdaLN + Linear(384 -> patch_dim) -> unpatchify -> v_vis (B, T, 4, H', W')
+      * proprio_head : (AntMaze only) Linear(384 -> 27) -> v_proprio (B, T, 27)
+
+--------------------------------------------------------------------------------
+3. TRAINING & EVALUATION HYPERPARAMETERS
+--------------------------------------------------------------------------------
+  Dataset clip length : num_steps = 4 (history_size=3 context + rollout_n=1 target), frameskip=5
+  Training objective  : Diffusion Forcing Rectified Flow velocity MSE loss
+  Optimizer           : AdamW (lr=1e-4, weight_decay=1e-3, cosine schedule with 5% warmup)
+  MPC Evaluation:
+    - Push-T  : horizon=15, receding_horizon=2, action_block=5, cost_last_n=2, eval_budget=90
+    - AntMaze : horizon=23, receding_horizon=2, action_block=5, cost_last_n=2, eval_budget=350
+    - ODE Rollout: num_ode_steps=4 (Euler or Midpoint), rollout_mode=parallel or autoregressive
+    - Solvers: GradientSolver (backprop through 4 ODE steps) and CEMSolver / MPPI (gradient-free)

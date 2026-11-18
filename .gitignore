@@ -10,6 +10,8 @@ __pycache__/
 diffusion_wm/assets/
 
 # run outputs & caches
+datasets/
+datasets_small/
 experiments/
 outputs/
 multirun/
