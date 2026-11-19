@@ -232,6 +232,7 @@ class SpatioTemporalDiT(nn.Module):
         action_embed_dim: int = 192,
         use_proprio: bool = False,
         proprio_dim: int = 0,
+        use_action_token: bool = False,
     ) -> None:
         super().__init__()
         assert latent_height % patch_size == 0 and latent_width % patch_size == 0, (
@@ -245,12 +246,17 @@ class SpatioTemporalDiT(nn.Module):
         self.max_seq_len = int(max_seq_len)
         self.use_proprio = bool(use_proprio)
         self.proprio_dim = int(proprio_dim) if use_proprio else 0
+        self.use_action_token = bool(use_action_token)
 
         self.grid_h = latent_height // patch_size
         self.grid_w = latent_width // patch_size
         self.num_vis_patches = self.grid_h * self.grid_w
         self.patch_dim = latent_channels * patch_size * patch_size
-        self.num_tokens = self.num_vis_patches + (1 if self.use_proprio else 0)
+        self.num_tokens = (
+            self.num_vis_patches
+            + (1 if self.use_proprio else 0)
+            + (1 if self.use_action_token else 0)
+        )
 
         self.patch_embed = nn.Linear(self.patch_dim, hidden_dim)
         if self.use_proprio:
@@ -264,6 +270,15 @@ class SpatioTemporalDiT(nn.Module):
         else:
             self.proprio_embed = None
             self.proprio_head = None
+
+        if self.use_action_token:
+            self.action_token_proj = nn.Sequential(
+                nn.Linear(action_embed_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.action_token_proj = None
 
         self.spatial_pos_embed = nn.Parameter(
             torch.randn(1, 1, self.num_tokens, hidden_dim) * 0.02
@@ -351,16 +366,17 @@ class SpatioTemporalDiT(nn.Module):
         t_len = z_vis.size(1)
         vis_tokens = self.patch_embed(self._patchify(z_vis))  # (B, T, N_patches, D)
 
+        token_parts = [vis_tokens]
         if self.use_proprio:
             if z_proprio is None:
                 raise ValueError(
                     'SpatioTemporalDiT configured with use_proprio=True, '
                     'but z_proprio was not provided.'
                 )
-            proprio_token = self.proprio_embed(z_proprio).unsqueeze(2)  # (B, T, 1, D)
-            tokens = torch.cat([vis_tokens, proprio_token], dim=2)
-        else:
-            tokens = vis_tokens
+            token_parts.append(self.proprio_embed(z_proprio).unsqueeze(2))  # (B, T, 1, D)
+        if getattr(self, 'use_action_token', False) and self.action_token_proj is not None:
+            token_parts.append(self.action_token_proj(act_emb).unsqueeze(2))  # (B, T, 1, D)
+        tokens = torch.cat(token_parts, dim=2) if len(token_parts) > 1 else vis_tokens
 
         tokens = (
             tokens
@@ -383,12 +399,13 @@ class SpatioTemporalDiT(nn.Module):
             else:
                 tokens = block(tokens, c)
 
+        vis_out_tokens = tokens[:, :, : self.num_vis_patches]
+        v_vis = self._unpatchify(self.vis_head(vis_out_tokens, c))
         if self.use_proprio:
-            vis_out_tokens = tokens[:, :, : self.num_vis_patches]
-            proprio_out_token = tokens[:, :, self.num_vis_patches :]
-            v_vis = self._unpatchify(self.vis_head(vis_out_tokens, c))
+            proprio_out_token = tokens[
+                :, :, self.num_vis_patches : self.num_vis_patches + 1
+            ]
             v_proprio = self.proprio_head(proprio_out_token, c).squeeze(2)
             return {'v_vis': v_vis, 'v_proprio': v_proprio}
 
-        v_vis = self._unpatchify(self.vis_head(tokens, c))
         return {'v_vis': v_vis}

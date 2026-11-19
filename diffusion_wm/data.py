@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 import stable_worldmodel as swm
@@ -210,23 +211,35 @@ def load_normalizer_artifact(path: str | Path) -> dict:
     return artifact
 
 
-def normalize_uint8_images_on_device(batch: dict) -> dict:
-    """Convert uint8 `(..., 3, H, W)` pixel tensors in `batch` to ImageNet-normalized float32."""
+def normalize_uint8_images_on_device(
+    batch: dict, img_size: int | None = None
+) -> dict:
+    """Convert uint8 `(..., 3, H, W)` pixel tensors to ImageNet-normalized float32 (optionally resizing)."""
     mean_vals = IMAGENET_STATS['mean']
     std_vals = IMAGENET_STATS['std']
+    target_hw = None if img_size is None else (int(img_size), int(img_size))
     for key, value in list(batch.items()):
         if not key.startswith('pixels'):
             continue
-        if not torch.is_tensor(value) or value.dtype != torch.uint8:
+        if not torch.is_tensor(value):
             continue
         if value.ndim < 4 or value.size(-3) != 3:
             raise ValueError(
-                f"Expected uint8 pixel tensor '{key}' to have channel-first RGB "
+                f"Expected pixel tensor '{key}' to have channel-first RGB "
                 f'shape (..., 3, H, W), got {tuple(value.shape)}'
             )
-        view_shape = [1] * value.ndim
-        view_shape[-3] = 3
-        mean = value.new_tensor(mean_vals, dtype=torch.float32).view(*view_shape)
-        std = value.new_tensor(std_vals, dtype=torch.float32).view(*view_shape)
-        batch[key] = value.float().div(255.0).sub(mean).div(std)
+        if value.dtype == torch.uint8:
+            view_shape = [1] * value.ndim
+            view_shape[-3] = 3
+            mean = value.new_tensor(mean_vals, dtype=torch.float32).view(*view_shape)
+            std = value.new_tensor(std_vals, dtype=torch.float32).view(*view_shape)
+            value = value.float().div(255.0).sub(mean).div(std)
+        if target_hw is not None and value.shape[-2:] != target_hw:
+            lead = value.shape[:-3]
+            flat = value.reshape(-1, 3, value.size(-2), value.size(-1)).float()
+            resized = F.interpolate(
+                flat, size=target_hw, mode='bilinear', align_corners=False
+            )
+            value = resized.reshape(*lead, 3, *target_hw)
+        batch[key] = value
     return batch

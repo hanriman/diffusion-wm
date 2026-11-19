@@ -189,53 +189,34 @@ class DiffusionWorldModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample Diffusion Forcing per-frame flow times `tau` in `[0, 1]`.
 
-        Combines three regimes across the batch so the model excels at both
-        parallel full-horizon ODE rollouts and autoregressive single-step rollouts:
-          1. Clean/stabilized history (`t < H_ctx` has `tau ~ U(1 - sigma, 1)`)
-             + synchronized future `tau` (`t >= H_ctx` shares one `tau ~ U(0, 1)`).
-          2. Clean/stabilized history + independent per-frame future `tau_t ~ U(0, 1)`.
-          3. Frame 0 clean (`tau_0 = 1`) + all subsequent frames `t >= 1` independent `tau_t ~ U(0, 1)`.
+        Spreads each batch evenly across context lengths `1..min(history_size, seq_len - 1)`
+        so both 1-frame eval starts and multi-frame context windows are trained, while
+        splitting future targets 50/50 between synchronized (parallel) and independent
+        (autoregressive) flow times.
 
         Returns:
             tau: `(B, T)` tensor of flow times in `[0, 1]`.
             loss_mask: `(B, T)` boolean/float mask of frames where velocity loss is active.
         """
-        h_ctx = min(max(1, history_size), seq_len - 1)
-        n_fut = seq_len - h_ctx
+        max_ctx = min(max(1, history_size), seq_len - 1)
+        ctx_lens = (torch.arange(batch_size, device=device) % max_ctx) + 1
+        frame_idx = torch.arange(seq_len, device=device).unsqueeze(0)
+        is_ctx = frame_idx < ctx_lens.unsqueeze(1)
+        loss_mask = (~is_ctx).float()
 
-        tau = torch.empty((batch_size, seq_len), device=device, dtype=torch.float32)
-        loss_mask = torch.zeros(
-            (batch_size, seq_len), device=device, dtype=torch.float32
-        )
-
-        # Context stabilization noise: tau_ctx in [1 - ctx_noise_std, 1.0]
         if self.ctx_noise_std > 0:
             tau_ctx = 1.0 - self.ctx_noise_std * torch.rand(
-                (batch_size, h_ctx), device=device
+                (batch_size, seq_len), device=device
             )
         else:
-            tau_ctx = torch.ones((batch_size, h_ctx), device=device)
+            tau_ctx = torch.ones((batch_size, seq_len), device=device)
 
-        tau[:, :h_ctx] = tau_ctx
-
-        # Split batch across synchronized-future (50%) and independent-future (50%)
+        tau_fut = torch.rand((batch_size, seq_len), device=device)
         half = batch_size // 2
         if half > 0:
-            sync_u = torch.rand((half, 1), device=device).expand(half, n_fut)
-            tau[:half, h_ctx:] = sync_u
-        if batch_size - half > 0:
-            indep_u = torch.rand((batch_size - half, n_fut), device=device)
-            tau[half:, h_ctx:] = indep_u
+            tau_fut[:half] = torch.rand((half, 1), device=device).expand(half, seq_len)
 
-        loss_mask[:, h_ctx:] = 1.0
-
-        # Also supervise intermediate frames t in [1, h_ctx) for a third of the batch
-        third = batch_size // 3
-        if third > 0 and h_ctx > 1:
-            tau[:third, 0] = 1.0
-            tau[:third, 1:h_ctx] = torch.rand((third, h_ctx - 1), device=device)
-            loss_mask[:third, 1:h_ctx] = 1.0
-
+        tau = torch.where(is_ctx, tau_ctx, tau_fut)
         return tau, loss_mask
 
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -818,6 +799,7 @@ def build_diffusion_world_model(cfg) -> DiffusionWorldModel:
         action_embed_dim=action_embed_dim,
         use_proprio=use_proprio,
         proprio_dim=proprio_dim,
+        use_action_token=bool(dit_cfg.get('use_action_token', False)),
     )
 
     return DiffusionWorldModel(

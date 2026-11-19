@@ -24,10 +24,11 @@ model_overrides:
   ode_solver: euler
   rollout_mode: autoregressive
   rollout_noise_scale: 0.0
-  rollout_batch_size: 32
+  rollout_batch_size: 64
   grad_checkpoint_rollout: false
   grad_checkpoint_blocks: false
   eval_autocast: true
+  proprio_cost_weight: 0.0
 solver:
   _target_: stable_worldmodel.solver.CEMSolver
   model: ???
@@ -52,7 +53,7 @@ eval:
   chunk_size: 1
   goal_offset_steps: 75
   eval_budget: 90
-  img_size: 224
+  img_size: 128
   dataset_name: pusht_expert_train
   callables:
     - method: _set_state

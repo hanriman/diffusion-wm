@@ -26,13 +26,13 @@ hydra:
   run:
     dir: ${oc.env:HJEPA_HOME,${oc.env:HOME}/.stable_worldmodel}/ckpts/${subdir}/hydra
 seed: 42
-img_size: 224
+img_size: 128
 num_workers: 8
 dump_object: true
 save_every_n_epochs: 1
 enable_logger: true
 trainer:
-  max_epochs: 10
+  max_epochs: 15
   devices: auto
   accelerator: gpu
   precision: bf16-mixed
@@ -49,7 +49,7 @@ loader:
   pin_memory: true
   shuffle: true
 optimizer:
-  lr: 1.0e-04
+  lr: 2.0e-04
   weight_decay: 0.001
   warmup_ratio: 0.05
 vae:
@@ -65,10 +65,10 @@ wm:
   rollout_n: 1
   action_dim: 2
   action_embed_dim: 384
-  use_proprio: false
-  proprio_dim: 0
+  use_proprio: true
+  proprio_dim: 4
   proprio_loss_weight: 1.0
-  proprio_cost_weight: 1.0
+  proprio_cost_weight: 0.0
   ctx_noise_std: 0.05
   num_ode_steps: 4
   ode_solver: euler
@@ -84,6 +84,7 @@ dit:
   mlp_ratio: 4.0
   dropout: 0.0
   max_seq_len: 32
+  use_action_token: true
 planning_eval:
   enabled: true
   config_name: pusht_gd

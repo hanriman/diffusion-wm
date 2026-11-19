@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import stable_worldmodel as swm
+from diffusion_wm.data import normalize_uint8_images_on_device
 from diffusion_wm.models import (
     DiffusionWorldModel,
     SpatioTemporalDiT,
@@ -64,7 +65,8 @@ def _make_model(
     )
 
 
-def test_dit_shapes_and_causal_masking():
+@pytest.mark.parametrize('use_action_token', [False, True])
+def test_dit_shapes_and_causal_masking(use_action_token: bool):
     torch.manual_seed(0)
     dit = SpatioTemporalDiT(
         latent_channels=4,
@@ -78,6 +80,7 @@ def test_dit_shapes_and_causal_masking():
         action_embed_dim=64,
         use_proprio=True,
         proprio_dim=27,
+        use_action_token=use_action_token,
     ).eval()
     torch.nn.init.normal_(dit.vis_head.linear.weight, std=0.05)
     torch.nn.init.normal_(dit.proprio_head.linear.weight, std=0.05)
@@ -348,3 +351,17 @@ def test_chunked_checkpointed_rollout_matches_exact_gradients(
     cost_legacy.sum().backward()
     torch.testing.assert_close(cost_ref, cost_legacy)
     torch.testing.assert_close(acts_ref.grad, acts_legacy.grad)
+
+
+def test_normalize_resize_and_tau_covers_hctx_1():
+    batch = {'pixels_level1': torch.randint(0, 255, (2, 4, 3, 224, 224), dtype=torch.uint8)}
+    out = normalize_uint8_images_on_device(batch, img_size=128)
+    assert out['pixels_level1'].shape == (2, 4, 3, 128, 128)
+    assert out['pixels_level1'].dtype == torch.float32
+
+    model = _make_model(img_size=64, patch_size=2, action_dim=2)
+    tau, mask = model._sample_training_tau(6, 4, 3, torch.device('cpu'))
+    assert tau.shape == (6, 4) and mask.shape == (6, 4)
+    # Sample 0 uses h_ctx=1 (matching eval start), sample 2 uses h_ctx=3
+    assert (mask[0] == torch.tensor([0.0, 1.0, 1.0, 1.0])).all()
+    assert (mask[2] == torch.tensor([0.0, 0.0, 0.0, 1.0])).all()

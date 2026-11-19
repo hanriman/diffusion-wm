@@ -51,7 +51,8 @@ class DiffusionWorldModelLightningModule(pl.LightningModule):
         self.cfg = cfg
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        batch = normalize_uint8_images_on_device(batch)
+        img_size = int(self.cfg.img_size) if 'img_size' in self.cfg else None
+        batch = normalize_uint8_images_on_device(batch, img_size=img_size)
         losses = self.model.compute_loss(batch)
         bs = batch['action_level1'].size(0)
         for k, v in losses.items():
@@ -68,7 +69,8 @@ class DiffusionWorldModelLightningModule(pl.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        batch = normalize_uint8_images_on_device(batch)
+        img_size = int(self.cfg.img_size) if 'img_size' in self.cfg else None
+        batch = normalize_uint8_images_on_device(batch, img_size=img_size)
         losses = self.model.compute_loss(batch)
         bs = batch['action_level1'].size(0)
         for k, v in losses.items():
