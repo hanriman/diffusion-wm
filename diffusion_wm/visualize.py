@@ -15,14 +15,15 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from PIL import Image, ImageDraw
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 import stable_worldmodel as swm
 
 try:
     from .planning_eval import (
+        _apply_model_overrides,
         _build_eval_process_from_policy_normalizer,
         _build_policy,
+        _eval_sdpa_kernel,
         _resolve_existing_path,
         img_transform,
         load_eval_config,
@@ -30,8 +31,10 @@ try:
     from .utils import resolve_model_checkpoint_path
 except ImportError:
     from planning_eval import (
+        _apply_model_overrides,
         _build_eval_process_from_policy_normalizer,
         _build_policy,
+        _eval_sdpa_kernel,
         _resolve_existing_path,
         img_transform,
         load_eval_config,
@@ -272,9 +275,14 @@ def visualize_world_model_dreams(
     vae_recon = model.decode_pixels(z_all)[0]
 
     ctx_vis = z_all[:, :h_ctx]
-    pred_vis, _ = model.sample_ode_parallel(
-        ctx_vis, fut_actions, ctx_proprio=ctx_proprio
-    )
+    if str(getattr(model, 'rollout_mode', 'parallel')).lower() == 'autoregressive':
+        pred_vis, _ = model.sample_ode_autoregressive(
+            ctx_vis, fut_actions, ctx_proprio=ctx_proprio
+        )
+    else:
+        pred_vis, _ = model.sample_ode_parallel(
+            ctx_vis, fut_actions, ctx_proprio=ctx_proprio
+        )
     dream_rgb = model.decode_pixels(pred_vis)[0]
 
     gt_u8 = _imagenet_to_uint8(norm_pixels)
@@ -449,7 +457,7 @@ def record_closed_loop_rollouts(
                 recorded_frames=recorded_frames,
                 budget=budget,
             )
-            with torch.enable_grad(), sdpa_kernel(SDPBackend.MATH):
+            with torch.enable_grad(), _eval_sdpa_kernel():
                 world.evaluate_from_dataset(
                     None,
                     episodes_idx=None,
@@ -499,6 +507,7 @@ def generate_presentation_report(
     num_dream_episodes: int = 2,
     num_rollout_videos: int = 2,
     max_rollout_steps: int | None = None,
+    num_samples: int | None = None,
 ) -> list[Path]:
     """Generate all training, dream, evaluation summary, and rollout visuals."""
     ckpt_path = resolve_model_checkpoint_path(policy_path, cache_dir)
@@ -511,6 +520,10 @@ def generate_presentation_report(
     cfg.policy = str(ckpt_path)
     if cache_dir is not None:
         cfg.cache_dir = str(cache_dir)
+    if num_samples is not None:
+        cfg.solver.num_samples = int(num_samples)
+        if 'num_elites' in cfg.solver and cfg.solver.num_elites is not None:
+            cfg.solver.num_elites = min(int(cfg.solver.num_elites), int(num_samples))
 
     generated: list[Path] = []
 
@@ -525,6 +538,7 @@ def generate_presentation_report(
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = swm.policy.AutoCostModel(str(ckpt_path), cache_dir).to(device).eval()
+    _apply_model_overrides(model, cfg)
     process = _build_eval_process_from_policy_normalizer(cfg, model=model)
 
     for ep_i in range(max(0, int(num_dream_episodes))):
@@ -562,6 +576,7 @@ def main() -> None:
     parser.add_argument('--num-dreams', type=int, default=2)
     parser.add_argument('--num-videos', type=int, default=2)
     parser.add_argument('--max-rollout-steps', type=int, default=None)
+    parser.add_argument('--num-samples', type=int, default=None)
     args = parser.parse_args()
 
     paths = generate_presentation_report(
@@ -574,6 +589,7 @@ def main() -> None:
         num_dream_episodes=args.num_dreams,
         num_rollout_videos=args.num_videos,
         max_rollout_steps=args.max_rollout_steps,
+        num_samples=args.num_samples,
     )
     for p in paths:
         print('Generated:', p)

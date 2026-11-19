@@ -176,6 +176,7 @@ def test_dreams_and_rollout_visuals_pusht(tmp_path: Path):
     }
 
     out_dir = tmp_path / 'viz'
+    model.rollout_mode = 'autoregressive'
     dream_path = visualize_world_model_dreams(
         eval_cfg, model, process, out_dir, episode_idx=0, num_future_steps=3
     )

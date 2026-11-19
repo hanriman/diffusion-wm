@@ -214,6 +214,7 @@ def _apply_model_overrides(model, cfg: DictConfig) -> None:
         'rollout_noise_scale',
         'rollout_batch_size',
         'grad_checkpoint_rollout',
+        'grad_checkpoint_blocks',
         'eval_autocast',
         'proprio_cost_weight',
     ):

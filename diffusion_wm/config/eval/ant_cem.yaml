@@ -35,10 +35,11 @@ load_eval_trajs_path: assets/eval_trajs/ant/expert_grid_d3_n50.pt
 model_overrides:
   num_ode_steps: 4
   ode_solver: euler
-  rollout_mode: parallel
+  rollout_mode: autoregressive
   rollout_noise_scale: 0.0
-  rollout_batch_size: 32
+  rollout_batch_size: 64
   grad_checkpoint_rollout: false
+  grad_checkpoint_blocks: false
   eval_autocast: true
   proprio_cost_weight: 1.0
 solver:

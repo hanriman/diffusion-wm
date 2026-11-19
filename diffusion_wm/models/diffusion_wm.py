@@ -52,8 +52,9 @@ class DiffusionWorldModel(nn.Module):
         ode_solver: str = 'euler',
         rollout_mode: str = 'parallel',
         rollout_noise_scale: float = 0.0,
-        rollout_batch_size: int | None = 8,
+        rollout_batch_size: int | None = 16,
         grad_checkpoint_rollout: bool = True,
+        grad_checkpoint_blocks: bool = False,
         eval_autocast: bool = True,
         action_queue_size: int = 0,
     ) -> None:
@@ -78,6 +79,7 @@ class DiffusionWorldModel(nn.Module):
             None if rollout_batch_size is None else max(1, int(rollout_batch_size))
         )
         self.grad_checkpoint_rollout = bool(grad_checkpoint_rollout)
+        self.grad_checkpoint_blocks = bool(grad_checkpoint_blocks)
         self.eval_autocast = bool(eval_autocast)
         self.level = 1
         self.num_levels = 1
@@ -441,6 +443,7 @@ class DiffusionWorldModel(nn.Module):
                 active_start=active_start,
                 checkpoint_blocks=False,
             )
+        ckpt_blocks = bool(getattr(self, 'grad_checkpoint_blocks', False))
         return checkpoint(
             lambda zv, zp, ts, ae: self._ode_step(
                 zv,
@@ -449,7 +452,7 @@ class DiffusionWorldModel(nn.Module):
                 ae,
                 dt=dt,
                 active_start=active_start,
-                checkpoint_blocks=True,
+                checkpoint_blocks=ckpt_blocks,
             ),
             z_vis_seq,
             z_p_seq,
@@ -672,7 +675,7 @@ class DiffusionWorldModel(nn.Module):
         )
 
         n_total = ctx_vis.size(0)
-        raw_chunk = getattr(self, 'rollout_batch_size', 8)
+        raw_chunk = getattr(self, 'rollout_batch_size', 16)
         chunk_size = int(raw_chunk) if raw_chunk is not None and int(raw_chunk) > 0 else n_total
 
         def _rollout_chunk(
@@ -833,8 +836,9 @@ def build_diffusion_world_model(cfg) -> DiffusionWorldModel:
         ode_solver=str(wm_cfg.get('ode_solver', 'euler')),
         rollout_mode=str(wm_cfg.get('rollout_mode', 'parallel')),
         rollout_noise_scale=float(wm_cfg.get('rollout_noise_scale', 0.0)),
-        rollout_batch_size=wm_cfg.get('rollout_batch_size', 8),
+        rollout_batch_size=wm_cfg.get('rollout_batch_size', 16),
         grad_checkpoint_rollout=bool(wm_cfg.get('grad_checkpoint_rollout', True)),
+        grad_checkpoint_blocks=bool(wm_cfg.get('grad_checkpoint_blocks', False)),
         eval_autocast=bool(wm_cfg.get('eval_autocast', True)),
         action_queue_size=int(wm_cfg.get('action_queue_size', 0)),
     )

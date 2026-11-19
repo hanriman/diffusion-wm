@@ -317,19 +317,29 @@ def test_chunked_checkpointed_rollout_matches_exact_gradients(
     cost_ref = model.get_cost(dict(info_base), acts_ref)
     cost_ref.sum().backward()
 
-    # Chunked (size=2 over b*s=6) + gradient checkpointing
+    # Chunked (size=2 over b*s=6) + single-level ODE-step checkpointing (default)
     model.rollout_batch_size = 2
     model.grad_checkpoint_rollout = True
+    model.grad_checkpoint_blocks = False
     cost_chk = model.get_cost(dict(info_base), acts_chk)
     cost_chk.sum().backward()
 
     torch.testing.assert_close(cost_ref, cost_chk)
     torch.testing.assert_close(acts_ref.grad, acts_chk.grad)
 
+    # Chunked + nested block checkpointing also matches exact gradients
+    acts_nested = acts_ref.detach().clone().requires_grad_(True)
+    model.grad_checkpoint_blocks = True
+    cost_nested = model.get_cost(dict(info_base), acts_nested)
+    cost_nested.sum().backward()
+    torch.testing.assert_close(cost_ref, cost_nested)
+    torch.testing.assert_close(acts_ref.grad, acts_nested.grad)
+
     # Legacy checkpoint compatibility: missing attributes fallback cleanly
     for attr in (
         'rollout_batch_size',
         'grad_checkpoint_rollout',
+        'grad_checkpoint_blocks',
         'eval_autocast',
     ):
         delattr(model, attr)

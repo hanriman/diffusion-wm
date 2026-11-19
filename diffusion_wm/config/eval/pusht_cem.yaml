@@ -22,10 +22,11 @@ load_eval_trajs_path: assets/eval_trajs/pusht/goal_offset_75_val.pt
 model_overrides:
   num_ode_steps: 4
   ode_solver: euler
-  rollout_mode: parallel
+  rollout_mode: autoregressive
   rollout_noise_scale: 0.0
-  rollout_batch_size: 16
+  rollout_batch_size: 32
   grad_checkpoint_rollout: false
+  grad_checkpoint_blocks: false
   eval_autocast: true
 solver:
   _target_: stable_worldmodel.solver.CEMSolver
