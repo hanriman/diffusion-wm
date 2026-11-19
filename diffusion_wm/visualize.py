@@ -250,6 +250,22 @@ def visualize_world_model_dreams(
     norm_pixels = torch.stack([tx(img) for img in sub_pixels]).to(device)
 
     # Stack and normalize actions over `frameskip`
+    ctx_actions = None
+    if h_ctx > 1:
+        ctx_act_blocks = []
+        for i in range(h_ctx - 1):
+            start_a = i * frameskip
+            chunk = np.asarray(raw_actions[start_a : start_a + frameskip])
+            if 'action' in process:
+                chunk = process['action'].transform(chunk)
+            ctx_act_blocks.append(chunk.reshape(-1))
+        ctx_actions = (
+            torch.from_numpy(np.stack(ctx_act_blocks))
+            .float()
+            .unsqueeze(0)
+            .to(device)
+        )
+
     act_blocks = []
     for i in range(num_future_steps):
         start_a = (h_ctx - 1 + i) * frameskip
@@ -277,11 +293,11 @@ def visualize_world_model_dreams(
     ctx_vis = z_all[:, :h_ctx]
     if str(getattr(model, 'rollout_mode', 'parallel')).lower() == 'autoregressive':
         pred_vis, _ = model.sample_ode_autoregressive(
-            ctx_vis, fut_actions, ctx_proprio=ctx_proprio
+            ctx_vis, fut_actions, ctx_proprio=ctx_proprio, ctx_actions=ctx_actions
         )
     else:
         pred_vis, _ = model.sample_ode_parallel(
-            ctx_vis, fut_actions, ctx_proprio=ctx_proprio
+            ctx_vis, fut_actions, ctx_proprio=ctx_proprio, ctx_actions=ctx_actions
         )
     dream_rgb = model.decode_pixels(pred_vis)[0]
 

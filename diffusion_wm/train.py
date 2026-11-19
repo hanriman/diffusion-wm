@@ -95,6 +95,7 @@ class DiffusionWorldModelLightningModule(pl.LightningModule):
             if n_fut > 0:
                 ctx_vis = z_vis[:, :h_ctx]
                 fut_vis_gt = z_vis[:, h_ctx:]
+                ctx_actions = actions[:, : h_ctx - 1] if h_ctx > 1 else None
                 # Actions transitioning from frame (h_ctx - 1) .. (T - 2) into frames h_ctx .. (T - 1)
                 fut_actions = actions[:, h_ctx - 1 : h_ctx - 1 + n_fut]
                 ctx_p = (
@@ -103,7 +104,10 @@ class DiffusionWorldModelLightningModule(pl.LightningModule):
                     else None
                 )
                 pred_vis_all, pred_p_all = self.model.sample_ode_parallel(
-                    ctx_vis, fut_actions, ctx_proprio=ctx_p
+                    ctx_vis,
+                    fut_actions,
+                    ctx_proprio=ctx_p,
+                    ctx_actions=ctx_actions,
                 )
                 ode_vis_mse = F.mse_loss(pred_vis_all[:, h_ctx:], fut_vis_gt)
                 self.log(
@@ -227,6 +231,9 @@ def train_from_config(cfg: DictConfig) -> DiffusionWorldModelLightningModule:
     val_loader = DataLoader(val_dataset, **val_loader_cfg)
 
     normalizer_artifact = build_normalizer_artifact(cfg, train_dataset)
+    for ds in (train_dataset, val_dataset):
+        if hasattr(ds, 'close'):
+            ds.close()
     model = build_diffusion_world_model(cfg)
     model.normalizer_artifact = normalizer_artifact
 

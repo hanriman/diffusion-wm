@@ -65,6 +65,9 @@ class HDF5Dataset:
             for target, source in keys_to_merge.items():
                 self.merge_col(source, target)
 
+        # Ensure no open h5py.File handle is retained across DataLoader worker forks.
+        self.close()
+
     def _setup_levels(self, level1: dict | None, **level_kwargs) -> None:
         def _normalize_level(level_cfg: dict | None, level_name: str) -> dict | None:
             if level_cfg is None:
@@ -172,6 +175,18 @@ class HDF5Dataset:
             self.h5_file = h5py.File(
                 self.h5_path, 'r', swmr=True, rdcc_nbytes=256 * 1024 * 1024
             )
+
+    def close(self) -> None:
+        if self.h5_file is not None:
+            try:
+                self.h5_file.close()
+            finally:
+                self.h5_file = None
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state['h5_file'] = None
+        return state
 
     def _load_slice_with_levels(self, ep_dix: int, start: int) -> dict:
         # Return the full level-1 sequence covering the largest span; the model

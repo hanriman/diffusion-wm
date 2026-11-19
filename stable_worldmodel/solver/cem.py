@@ -77,6 +77,13 @@ class CEMSolver(torch.nn.Module):
         self.level: int = 1
         self.solve_records: list[dict[str, Any]] = []
         self._prev_mean: torch.Tensor | None = None
+        self._action_bounds: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def set_action_bounds(self, low: np.ndarray | torch.Tensor, high: np.ndarray | torch.Tensor) -> None:
+        """Set per-dimension (normalized) action clipping bounds from env action_space."""
+        low_t = torch.as_tensor(low, dtype=torch.float32, device=self.device).reshape(-1)
+        high_t = torch.as_tensor(high, dtype=torch.float32, device=self.device).reshape(-1)
+        self._action_bounds = (low_t, high_t)
 
     def configure(
         self,
@@ -243,10 +250,25 @@ class CEMSolver(torch.nn.Module):
                 # Include current mean as candidate 0 for elitist stability
                 candidates[:, 0] = b_mean
 
+                lower: torch.Tensor | None = None
+                upper: torch.Tensor | None = None
                 if self.action_clip_sigma is not None:
-                    lower = (prior_mean - self.action_clip_sigma * prior_std).view(1, 1, 1, -1)
-                    upper = (prior_mean + self.action_clip_sigma * prior_std).view(1, 1, 1, -1)
-                    candidates.clamp_(min=lower, max=upper)
+                    lower = prior_mean - self.action_clip_sigma * prior_std
+                    upper = prior_mean + self.action_clip_sigma * prior_std
+                env_bounds = getattr(self, '_action_bounds', None)
+                if env_bounds is not None:
+                    env_low, env_high = (
+                        env_bounds[0].to(self.device),
+                        env_bounds[1].to(self.device),
+                    )
+                    if env_low.numel() == self.action_dim:
+                        lower = env_low if lower is None else torch.maximum(lower, env_low)
+                        upper = env_high if upper is None else torch.minimum(upper, env_high)
+                if lower is not None and upper is not None:
+                    candidates.clamp_(
+                        min=lower.view(1, 1, 1, -1),
+                        max=upper.view(1, 1, 1, -1),
+                    )
 
                 current_info = expanded_infos.copy()
                 current_info['cost_last_n'] = cost_last_n

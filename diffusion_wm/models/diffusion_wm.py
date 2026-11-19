@@ -198,6 +198,10 @@ class DiffusionWorldModel(nn.Module):
             tau: `(B, T)` tensor of flow times in `[0, 1]`.
             loss_mask: `(B, T)` boolean/float mask of frames where velocity loss is active.
         """
+        if seq_len < 2:
+            raise ValueError(
+                f'seq_len must be >= 2 for Diffusion Forcing training, got {seq_len}'
+            )
         max_ctx = min(max(1, history_size), seq_len - 1)
         ctx_lens = (torch.arange(batch_size, device=device) % max_ctx) + 1
         frame_idx = torch.arange(seq_len, device=device).unsqueeze(0)
@@ -302,8 +306,10 @@ class DiffusionWorldModel(nn.Module):
             out['loss'] = total_loss
             out['rf_proprio_loss'] = proprio_loss.detach()
 
-        if hasattr(self.vae, 'reconstruction_loss') and not getattr(
-            self.vae, 'freeze', True
+        if (
+            pixels is not None
+            and hasattr(self.vae, 'reconstruction_loss')
+            and not getattr(self.vae, 'freeze', True)
         ):
             vae_recon_loss = self.vae.reconstruction_loss(pixels)
             out['loss'] = out['loss'] + vae_recon_loss
@@ -454,12 +460,32 @@ class DiffusionWorldModel(nn.Module):
             * self.rollout_noise_scale
         )
 
+    def _build_context_action_embeddings(
+        self,
+        n_batch: int,
+        h_ctx: int,
+        ctx_actions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build context action embeddings aligned with `_build_shifted_action_embeddings`."""
+        if ctx_actions is not None and h_ctx > 1:
+            return torch.cat(
+                [
+                    self.null_action_emb.expand(n_batch, 1, -1),
+                    self.action_embed(ctx_actions[:, : h_ctx - 1].float()),
+                ],
+                dim=1,
+            )
+        return self.null_action_emb.expand(n_batch, h_ctx, -1)
+
     def sample_ode_parallel(
         self,
         ctx_vis: torch.Tensor,
         actions: torch.Tensor,
         ctx_proprio: torch.Tensor | None = None,
         num_ode_steps: int | None = None,
+        ctx_actions: torch.Tensor | None = None,
+        init_vis: torch.Tensor | None = None,
+        init_p: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Denoise all `T_plan` future steps in parallel in `K` ODE steps.
 
@@ -468,6 +494,10 @@ class DiffusionWorldModel(nn.Module):
             actions: Candidate action sequence `(N, T_plan, stacked_action_dim)`.
             ctx_proprio: Optional clean context proprio `(N, H_ctx, proprio_dim)`.
             num_ode_steps: Optional override for number of Euler/Midpoint steps.
+            ctx_actions: Optional context actions `(N, H_ctx - 1, stacked_action_dim)`
+                for `H_ctx > 1`.
+            init_vis: Optional pre-drawn initial noise `(N, T_plan, 4, H', W')`.
+            init_p: Optional pre-drawn initial proprio noise `(N, T_plan, proprio_dim)`.
 
         Returns:
             `(pred_vis, pred_proprio)` containing the full trajectory of length
@@ -479,25 +509,31 @@ class DiffusionWorldModel(nn.Module):
         device = ctx_vis.device
         dtype = ctx_vis.dtype
 
-        z_fut_vis = self._init_future_noise(
-            (n_batch, t_plan, c, hp, wp), device, dtype
+        z_fut_vis = (
+            init_vis
+            if init_vis is not None
+            else self._init_future_noise((n_batch, t_plan, c, hp, wp), device, dtype)
         )
         z_vis_seq = torch.cat([ctx_vis, z_fut_vis], dim=1)
 
         if self.use_proprio:
             assert ctx_proprio is not None, 'ctx_proprio required when use_proprio=True'
-            z_fut_p = self._init_future_noise(
-                (n_batch, t_plan, self.proprio_dim), device, ctx_proprio.dtype
+            z_fut_p = (
+                init_p
+                if init_p is not None
+                else self._init_future_noise(
+                    (n_batch, t_plan, self.proprio_dim), device, ctx_proprio.dtype
+                )
             )
             z_p_seq = torch.cat([ctx_proprio, z_fut_p], dim=1)
         else:
             z_p_seq = None
 
-        # Build action conditioning for [0..H_ctx + T_plan - 1]:
-        # Frames 0..H_ctx-1 get null_action_emb; frame H_ctx + k gets action[:, k]
-        null_ctx = self.null_action_emb.expand(n_batch, h_ctx, -1)
+        ctx_act_embs = self._build_context_action_embeddings(
+            n_batch, h_ctx, ctx_actions=ctx_actions
+        )
         fut_act_emb = self.action_embed(actions.float())
-        act_emb_seq = torch.cat([null_ctx, fut_act_emb], dim=1)
+        act_emb_seq = torch.cat([ctx_act_embs, fut_act_emb], dim=1)
 
         dt = 1.0 / float(k_steps)
         use_ckpt = bool(getattr(self, 'grad_checkpoint_rollout', True)) and (
@@ -534,20 +570,34 @@ class DiffusionWorldModel(nn.Module):
         ctx_proprio: torch.Tensor | None = None,
         num_ode_steps: int | None = None,
         history_size: int | None = None,
+        ctx_actions: torch.Tensor | None = None,
+        init_vis: torch.Tensor | None = None,
+        init_p: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Denoise future steps sequentially one frame at a time with sliding context."""
         k_steps = max(1, int(num_ode_steps or self.num_ode_steps))
         hs = max(1, int(history_size or self.history_size))
-        n_batch, _, c, hp, wp = ctx_vis.shape
+        n_batch, h_ctx, c, hp, wp = ctx_vis.shape
         t_plan = actions.size(1)
         device = ctx_vis.device
         dtype = ctx_vis.dtype
         dt = 1.0 / float(k_steps)
 
+        if init_vis is None:
+            init_vis = self._init_future_noise(
+                (n_batch, t_plan, c, hp, wp), device, dtype
+            )
+        if self.use_proprio and ctx_proprio is not None and init_p is None:
+            init_p = self._init_future_noise(
+                (n_batch, t_plan, self.proprio_dim), device, ctx_proprio.dtype
+            )
+
         vis_traj = ctx_vis
         p_traj = ctx_proprio if self.use_proprio else None
         act_emb_all = self.action_embed(actions.float())  # (N, T_plan, A_emb)
-        past_act_embs = self.null_action_emb.expand(n_batch, ctx_vis.size(1), -1)
+        past_act_embs = self._build_context_action_embeddings(
+            n_batch, h_ctx, ctx_actions=ctx_actions
+        )
 
         use_ckpt = bool(getattr(self, 'grad_checkpoint_rollout', True)) and (
             torch.is_grad_enabled()
@@ -556,21 +606,24 @@ class DiffusionWorldModel(nn.Module):
         for step_t in range(t_plan):
             win_vis = vis_traj[:, -hs:]
             win_len = win_vis.size(1)
-            z_next_vis = self._init_future_noise(
-                (n_batch, 1, c, hp, wp), device, dtype
-            )
+            z_next_vis = init_vis[:, step_t : step_t + 1]
             cur_vis_seq = torch.cat([win_vis, z_next_vis], dim=1)
 
             if self.use_proprio and p_traj is not None:
                 win_p = p_traj[:, -hs:]
-                z_next_p = self._init_future_noise(
-                    (n_batch, 1, self.proprio_dim), device, p_traj.dtype
-                )
+                z_next_p = init_p[:, step_t : step_t + 1]
                 cur_p_seq = torch.cat([win_p, z_next_p], dim=1)
             else:
                 cur_p_seq = None
 
             win_act_emb = past_act_embs[:, -win_len:]
+            # Frame 0 of every training clip always received null_action_emb; preserve that
+            # invariant whenever the sliding window shifts past the initial frame.
+            if past_act_embs.size(1) > win_len:
+                win_act_emb = torch.cat(
+                    [self.null_action_emb.expand(n_batch, 1, -1), win_act_emb[:, 1:]],
+                    dim=1,
+                )
             next_act_emb = act_emb_all[:, step_t : step_t + 1]
             cur_act_emb = torch.cat([win_act_emb, next_act_emb], dim=1)
 
@@ -655,28 +708,50 @@ class DiffusionWorldModel(nn.Module):
             else None
         )
 
-        n_total = ctx_vis.size(0)
+        n_total, _, c, hp, wp = ctx_vis.shape
+        t_plan = act_flat.size(1)
+        all_init_vis = self._init_future_noise(
+            (n_total, t_plan, c, hp, wp), ctx_vis.device, ctx_vis.dtype
+        )
+        all_init_p = (
+            self._init_future_noise(
+                (n_total, t_plan, self.proprio_dim), ctx_p.device, ctx_p.dtype
+            )
+            if ctx_p is not None
+            else None
+        )
+
         raw_chunk = getattr(self, 'rollout_batch_size', 16)
         chunk_size = int(raw_chunk) if raw_chunk is not None and int(raw_chunk) > 0 else n_total
 
         def _rollout_chunk(
-            c_vis: torch.Tensor, c_act: torch.Tensor, c_p: torch.Tensor | None
+            c_vis: torch.Tensor,
+            c_act: torch.Tensor,
+            c_p: torch.Tensor | None,
+            c_init_vis: torch.Tensor,
+            c_init_p: torch.Tensor | None,
         ) -> tuple[torch.Tensor, torch.Tensor | None]:
-            if self.rollout_mode == 'autoregressive':
+            if str(self.rollout_mode).lower() == 'autoregressive':
                 return self.sample_ode_autoregressive(
                     c_vis,
                     c_act,
                     ctx_proprio=c_p,
                     history_size=history_size or self.history_size,
+                    init_vis=c_init_vis,
+                    init_p=c_init_p,
                 )
             return self.sample_ode_parallel(
                 c_vis,
                 c_act,
                 ctx_proprio=c_p,
+                init_vis=c_init_vis,
+                init_p=c_init_p,
             )
 
         if n_total <= chunk_size:
-            pred_vis, pred_p = _rollout_chunk(ctx_vis, act_flat, ctx_p)
+            pred_vis, pred_p = _rollout_chunk(
+                ctx_vis, act_flat, ctx_p, all_init_vis, all_init_p
+            )
         else:
             vis_chunks = []
             p_chunks = []
@@ -686,6 +761,8 @@ class DiffusionWorldModel(nn.Module):
                     ctx_vis[start:end],
                     act_flat[start:end],
                     ctx_p[start:end] if ctx_p is not None else None,
+                    all_init_vis[start:end],
+                    all_init_p[start:end] if all_init_p is not None else None,
                 )
                 vis_chunks.append(pv)
                 if pp is not None:
@@ -693,6 +770,7 @@ class DiffusionWorldModel(nn.Module):
             pred_vis = torch.cat(vis_chunks, dim=0)
             pred_p = torch.cat(p_chunks, dim=0) if p_chunks else None
 
+        info['rollout_ctx_len'] = int(ctx_vis.shape[1])
         info['predicted_embed_0'] = rearrange(
             pred_vis, '(b s) ... -> b s ...', b=b, s=s
         )
@@ -705,7 +783,8 @@ class DiffusionWorldModel(nn.Module):
 
     def criterion(self, info_dict: dict) -> torch.Tensor:
         """Compute planning cost over the last `cost_last_n` predicted steps."""
-        pred_vis = info_dict['predicted_embed_0'][:, :, 1:]
+        ctx_len = max(1, int(info_dict.get('rollout_ctx_len', 1)))
+        pred_vis = info_dict['predicted_embed_0'][:, :, ctx_len:]
         cost_last_n = max(1, int(info_dict.get('cost_last_n', 1)))
         cost_window = min(cost_last_n, pred_vis.shape[2])
 
@@ -722,7 +801,7 @@ class DiffusionWorldModel(nn.Module):
             and 'predicted_proprio_0' in info_dict
             and 'goal_proprio_0' in info_dict
         ):
-            pred_p = info_dict['predicted_proprio_0'][:, :, 1:][:, :, -cost_window:]
+            pred_p = info_dict['predicted_proprio_0'][:, :, ctx_len:][:, :, -cost_window:]
             goal_p = info_dict['goal_proprio_0'].expand_as(pred_p).detach()
             p_cost = F.mse_loss(pred_p, goal_p, reduction='none').mean(dim=-1)
             total_step_cost = (
@@ -762,9 +841,9 @@ class DiffusionWorldModel(nn.Module):
             _goal.pop('action', None)
             with torch.no_grad():
                 _goal = self.encode(_goal)
-            info_dict['goal_embed_0'] = _goal['embed_0'].unsqueeze(1)
+            info_dict['goal_embed_0'] = _goal['embed_0'][:, -1:].unsqueeze(1)
             if self.use_proprio and 'proprio_0' in _goal:
-                info_dict['goal_proprio_0'] = _goal['proprio_0'].unsqueeze(1)
+                info_dict['goal_proprio_0'] = _goal['proprio_0'][:, -1:].unsqueeze(1)
 
         info_dict = self.rollout(info_dict, action_candidates.to(device))
         return self.criterion(info_dict)

@@ -38,12 +38,13 @@ def _default_device() -> str:
 
 
 def img_transform(cfg):
+    img_size = int(cfg.eval.img_size)
     return transforms.Compose(
         [
             transforms.ToImage(),
             transforms.ToDtype(torch.float32, scale=True),
             transforms.Normalize(**IMAGENET_STATS),
-            transforms.Resize(size=int(cfg.eval.img_size)),
+            transforms.Resize(size=(img_size, img_size)),
         ]
     )
 
@@ -203,23 +204,29 @@ def _eval_sdpa_kernel():
     )
 
 
+MODEL_OVERRIDE_KEYS = (
+    'num_ode_steps',
+    'ode_solver',
+    'rollout_mode',
+    'rollout_noise_scale',
+    'rollout_batch_size',
+    'grad_checkpoint_rollout',
+    'grad_checkpoint_blocks',
+    'eval_autocast',
+    'proprio_cost_weight',
+)
+
+
 def _apply_model_overrides(model, cfg: DictConfig) -> None:
     overrides = cfg.get('model_overrides', None)
     if not overrides:
         return
-    for key in (
-        'num_ode_steps',
-        'ode_solver',
-        'rollout_mode',
-        'rollout_noise_scale',
-        'rollout_batch_size',
-        'grad_checkpoint_rollout',
-        'grad_checkpoint_blocks',
-        'eval_autocast',
-        'proprio_cost_weight',
-    ):
+    for key in MODEL_OVERRIDE_KEYS:
         if key in overrides and overrides[key] is not None:
-            setattr(model, key, overrides[key])
+            val = overrides[key]
+            if key in ('ode_solver', 'rollout_mode'):
+                val = str(val).lower()
+            setattr(model, key, val)
 
 
 def load_model(cfg: DictConfig, model=None):

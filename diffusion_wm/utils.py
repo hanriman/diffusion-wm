@@ -116,25 +116,46 @@ class PlanningEvalCallback(Callback):
         self._last_eval_step = None
 
     def _run_eval(self, trainer, pl_module, epoch: int) -> None:
-        from .planning_eval import load_eval_config, run_planning_eval
+        from .planning_eval import (
+            MODEL_OVERRIDE_KEYS,
+            load_eval_config,
+            run_planning_eval,
+        )
 
         cfg = load_eval_config(config_name=self.eval_cfg.config_name)
         cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+        train_cfg = getattr(pl_module, 'cfg', None)
+        if train_cfg is not None:
+            train_cache = train_cfg.get('cache_dir', None)
+            if train_cache is not None:
+                cfg.cache_dir = train_cache
+            if 'img_size' in train_cfg and 'eval' in cfg:
+                cfg.eval.img_size = int(train_cfg.img_size)
         overrides = self.eval_cfg.get('overrides', None)
         if overrides is not None:
             cfg = OmegaConf.merge(cfg, overrides)
         cfg.solver.seed = int(self.seed)
 
-        was_training = pl_module.model.training
+        model = pl_module.model
+        was_training = model.training
+        saved_device = next(model.parameters()).device
+        saved_attrs = {
+            k: getattr(model, k)
+            for k in (*MODEL_OVERRIDE_KEYS, 'interpolate_pos_encoding')
+            if hasattr(model, k)
+        }
         try:
-            pl_module.model.eval()
+            model.eval()
             metrics = run_planning_eval(
                 cfg,
-                model=pl_module.model,
+                model=model,
                 results_dir=self.run_dir / self.output_subdir / f'epoch_{epoch:04d}',
             )
         finally:
-            pl_module.model.train(was_training)
+            for k, v in saved_attrs.items():
+                setattr(model, k, v)
+            model.to(saved_device)
+            model.train(was_training)
 
         if trainer.logger is not None and isinstance(metrics, dict):
             prefix = f'planning_eval/{self.eval_cfg.config_name}'

@@ -365,3 +365,168 @@ def test_normalize_resize_and_tau_covers_hctx_1():
     # Sample 0 uses h_ctx=1 (matching eval start), sample 2 uses h_ctx=3
     assert (mask[0] == torch.tensor([0.0, 1.0, 1.0, 1.0])).all()
     assert (mask[2] == torch.tensor([0.0, 0.0, 0.0, 1.0])).all()
+
+
+def test_autoregressive_sliding_window_preserves_null_action_at_pos0():
+    torch.manual_seed(0)
+    model = _make_model(
+        img_size=64,
+        patch_size=2,
+        action_dim=2,
+        frameskip=5,
+        rollout_mode='autoregressive',
+        num_ode_steps=1,
+    ).eval()
+
+    recorded_act_embs = []
+    orig_dit_forward = model.dit.forward
+
+    def _spy_forward(z_vis, tau, act_emb, z_proprio=None, **kwargs):
+        recorded_act_embs.append(act_emb.detach().clone())
+        return orig_dit_forward(z_vis, tau, act_emb, z_proprio=z_proprio, **kwargs)
+
+    model.dit.forward = _spy_forward
+
+    ctx_vis = torch.randn(1, 1, 4, 8, 8)
+    actions = torch.randn(1, 5, 10)  # 5 future steps > history_size=2
+    model.sample_ode_autoregressive(ctx_vis, actions, history_size=2)
+
+    assert len(recorded_act_embs) == 5
+    null_emb = model.null_action_emb.detach()[0, 0]
+    for step_t, act_emb in enumerate(recorded_act_embs):
+        torch.testing.assert_close(
+            act_emb[0, 0],
+            null_emb,
+            msg=f'Slot 0 at autoregressive step {step_t} must use null_action_emb',
+        )
+
+
+def test_multi_context_actions_criterion_and_goal_time_dim():
+    torch.manual_seed(1)
+    model = _make_model(
+        img_size=64,
+        patch_size=2,
+        action_dim=2,
+        frameskip=5,
+        rollout_mode='parallel',
+        num_ode_steps=2,
+    ).eval()
+
+    # Verify ctx_actions affects multi-context rollout (h_ctx=3)
+    ctx_vis = torch.randn(2, 3, 4, 8, 8)
+    fut_actions = torch.randn(2, 1, 10)
+    ctx_acts_a = torch.zeros(2, 2, 10)
+    ctx_acts_b = torch.ones(2, 2, 10) * 3.0
+    pred_a, _ = model.sample_ode_parallel(ctx_vis, fut_actions, ctx_actions=ctx_acts_a)
+    pred_b, _ = model.sample_ode_parallel(ctx_vis, fut_actions, ctx_actions=ctx_acts_b)
+    assert (pred_a[:, -1] - pred_b[:, -1]).abs().sum() > 0
+
+    # Verify criterion only scores predicted frames (excludes context frames even if t_plan < cost_last_n)
+    info_dict = {
+        'pixels': torch.randn(2, 3, 3, 3, 64, 64),  # H_ctx = 3
+        'goal': torch.randn(2, 3, 3, 3, 64, 64),    # H_goal = 3
+        'cost_last_n': 2,
+    }
+    acts = torch.randn(2, 3, 1, 10)  # T_plan = 1 < cost_last_n = 2
+    costs = model.get_cost(info_dict, acts)
+    assert costs.shape == (2, 3)
+    assert info_dict['rollout_ctx_len'] == 3
+    assert info_dict['goal_embed_0'].shape[2] == 1
+
+
+@pytest.mark.parametrize('rollout_mode', ['parallel', 'autoregressive'])
+def test_rollout_noise_chunked_matches_unchunked(rollout_mode: str):
+    torch.manual_seed(5)
+    model = _make_model(
+        img_size=64,
+        patch_size=2,
+        action_dim=2,
+        frameskip=5,
+        rollout_mode=rollout_mode,
+        num_ode_steps=2,
+    ).eval()
+    model.rollout_noise_scale = 0.5
+
+    b, s, t_plan = 2, 3, 4
+    info_base = {
+        'pixels': torch.randn(b, s, 1, 3, 64, 64),
+        'goal': torch.randn(b, s, 1, 3, 64, 64),
+        'cost_last_n': 2,
+    }
+    actions = torch.randn(b, s, t_plan, 10)
+
+    model.rollout_batch_size = None
+    cost_ref = model.get_cost(dict(info_base), actions)
+
+    model.rollout_batch_size = 2
+    cost_chk = model.get_cost(dict(info_base), actions)
+
+    torch.testing.assert_close(cost_ref, cost_chk)
+
+
+def test_hdf5_dataset_closes_handle_before_dataloader_fork(tmp_path):
+    import h5py
+    from torch.utils.data import DataLoader
+
+    h5_path = tmp_path / 'fork_test.h5'
+    n_eps, ep_len = 2, 25
+    total = n_eps * ep_len
+    with h5py.File(h5_path, 'w') as f:
+        f.create_dataset('pixels', data=np.zeros((total, 16, 16, 3), dtype=np.uint8))
+        f.create_dataset('action', data=np.zeros((total, 2), dtype=np.float32))
+        f.create_dataset('qpos', data=np.zeros((total, 5), dtype=np.float32))
+        f.create_dataset('qvel', data=np.zeros((total, 4), dtype=np.float32))
+        f.create_dataset('ep_len', data=np.full((n_eps,), ep_len, dtype=np.int64))
+        f.create_dataset('ep_offset', data=np.arange(0, total, ep_len, dtype=np.int64))
+
+    ds = swm.data.HDF5Dataset(
+        'fork_test',
+        keys_to_load=['pixels', 'action', 'proprio'],
+        keys_to_cache=['action'],
+        keys_to_merge={'proprio': [{'key': 'qpos', 'start': 2}, 'qvel']},
+        cache_dir=tmp_path,
+        level1={'frameskip': 5, 'num_steps': 4},
+    )
+    assert ds.h5_file is None
+
+    loader = DataLoader(ds, batch_size=4, num_workers=2)
+    batch = next(iter(loader))
+    assert batch['proprio_level1'].shape == (4, 4, 7)
+
+
+def test_planning_overrides_normalization_and_action_bounds():
+    from omegaconf import OmegaConf
+
+    from diffusion_wm.planning_eval import _apply_model_overrides
+
+    model = _make_model(img_size=64, patch_size=2, action_dim=2).eval()
+    _apply_model_overrides(
+        model,
+        OmegaConf.create({'model_overrides': {'rollout_mode': 'AUTOREGRESSIVE', 'ode_solver': 'MIDPOINT'}}),
+    )
+    assert model.rollout_mode == 'autoregressive'
+    assert model.ode_solver == 'midpoint'
+
+    # Verify GradientSolver respects action_bounds passed via set_action_bounds
+    action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(1, 2), dtype=np.float32)
+    plan_cfg = swm.PlanConfig(horizon=2, receding_horizon=1, action_block=5, cost_last_n=1)
+    gd_solver = swm.solver.GradientSolver(
+        model=model,
+        n_steps=5,
+        min_its=5,
+        num_samples=2,
+        var_scale=2.0,
+        device='cpu',
+        seed=0,
+        optimizer_cls=torch.optim.AdamW,
+        optimizer_kwargs={'lr': 1.0},
+    )
+    gd_solver.configure(action_space=action_space, n_envs=1, config=plan_cfg)
+    gd_solver.set_action_bounds(np.full(10, -1.0), np.full(10, 1.0))
+    out = gd_solver.solve(
+        {'pixels': torch.randn(1, 1, 3, 64, 64), 'goal': torch.randn(1, 1, 3, 64, 64)},
+        planning_horizon=2,
+        steps_taken=0,
+        eval_budget=10,
+    )
+    assert (out['actions'] >= -1.0 - 1e-6).all() and (out['actions'] <= 1.0 + 1e-6).all()

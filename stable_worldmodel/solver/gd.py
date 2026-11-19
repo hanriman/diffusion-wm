@@ -72,9 +72,16 @@ class GradientSolver(torch.nn.Module):
         self._n_envs = None
         self._action_dim = None
         self._config = None
+        self._action_bounds: tuple[torch.Tensor, torch.Tensor] | None = None
         # Per-solve compute metadata, appended on every solve() call; collected by
         # the eval to compute planner FLOPs (see planning_eval.pop_solve_records).
         self.solve_records = []
+
+    def set_action_bounds(self, low: np.ndarray | torch.Tensor, high: np.ndarray | torch.Tensor) -> None:
+        """Set per-dimension (normalized) action clipping bounds from env action_space."""
+        low_t = torch.as_tensor(low, dtype=torch.float32, device=self.device).reshape(-1)
+        high_t = torch.as_tensor(high, dtype=torch.float32, device=self.device).reshape(-1)
+        self._action_bounds = (low_t, high_t)
 
     def configure(
         self,
@@ -176,7 +183,10 @@ class GradientSolver(torch.nn.Module):
         return mean, std
 
     def _get_action_clip_bounds(self) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Estimate per-dimension clipping bounds from queued latent actions."""
+        """Estimate per-dimension clipping bounds from prior stats and env action bounds."""
+        lower: torch.Tensor | None = None
+        upper: torch.Tensor | None = None
+
         if self.action_clip_sigma is not None:
             prior_stats = self._get_action_prior_stats()
             if prior_stats is None:
@@ -184,18 +194,28 @@ class GradientSolver(torch.nn.Module):
                 std = torch.ones(self.action_dim, device=self.device)
             else:
                 mean, std = prior_stats
-            return mean - self.action_clip_sigma * std, mean + self.action_clip_sigma * std
+            lower = mean - self.action_clip_sigma * std
+            upper = mean + self.action_clip_sigma * std
+        else:
+            queue = getattr(self.model, 'get_latent_action_queue', lambda: None)()
+            if torch.is_tensor(queue) and queue.numel() > 0:
+                assert queue.ndim == 2
+                queue = queue.detach().to(self.device)
+                lower = torch.quantile(queue, 0.02, dim=0)
+                upper = torch.quantile(queue, 0.98, dim=0)
 
-        queue = getattr(self.model, 'get_latent_action_queue', lambda: None)()
-        if not (torch.is_tensor(queue) and queue.numel() > 0):
+        env_bounds = getattr(self, '_action_bounds', None)
+        if env_bounds is not None:
+            env_low, env_high = (
+                env_bounds[0].to(self.device),
+                env_bounds[1].to(self.device),
+            )
+            if env_low.numel() == self.action_dim:
+                lower = env_low if lower is None else torch.maximum(lower, env_low)
+                upper = env_high if upper is None else torch.minimum(upper, env_high)
+
+        if lower is None or upper is None:
             return None
-
-        assert queue.ndim == 2
-
-        queue = queue.detach().to(self.device)
-        lower = torch.quantile(queue, 0.02, dim=0)
-        upper = torch.quantile(queue, 0.98, dim=0)
-
         return lower, upper
 
     @property

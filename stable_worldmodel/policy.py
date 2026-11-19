@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from collections.abc import Callable
 
+import gymnasium as gym
 import numpy as np
 import torch
 from loguru import logger as logging
@@ -366,11 +367,37 @@ class WorldModelPolicy(BasePolicy):
         self.solver.configure(
             action_space=env.action_space, n_envs=n_envs, config=self.cfg
         )
+        self._configure_solver_action_bounds(env.action_space)
         self.reset()
 
         assert isinstance(self.solver, Solver), (
             'Solver must implement the Solver protocol'
         )
+
+    def _configure_solver_action_bounds(self, action_space: Any) -> None:
+        """Pass normalized env action_space Box bounds to solvers that support them."""
+        if not hasattr(self.solver, 'set_action_bounds'):
+            return
+        if not isinstance(action_space, gym.spaces.Box):
+            return
+        low = np.asarray(action_space.low, dtype=np.float32)
+        high = np.asarray(action_space.high, dtype=np.float32)
+        if not (np.isfinite(low).all() and np.isfinite(high).all()):
+            return
+        # Handle vectorized Box space (n_envs, act_dim) -> single env (1, act_dim)
+        if low.ndim >= 2:
+            low_1d = low[0].reshape(1, -1)
+            high_1d = high[0].reshape(1, -1)
+        else:
+            low_1d = low.reshape(1, -1)
+            high_1d = high.reshape(1, -1)
+        if 'action' in self.process:
+            low_1d = self.process['action'].transform(low_1d)
+            high_1d = self.process['action'].transform(high_1d)
+        action_block = int(self.execution_plan_config.action_block)
+        low_block = np.tile(low_1d.reshape(-1), action_block)
+        high_block = np.tile(high_1d.reshape(-1), action_block)
+        self.solver.set_action_bounds(low_block, high_block)
 
     def reset(self) -> None:
         """Clear action buffers and step counters for a new rollout."""
@@ -434,6 +461,12 @@ class WorldModelPolicy(BasePolicy):
         # post-process action
         if 'action' in self.process:
             action = self.process['action'].inverse_transform(action)
+        if isinstance(self.env.action_space, gym.spaces.Box):
+            action = np.clip(
+                action,
+                self.env.action_space.low,
+                self.env.action_space.high,
+            )
 
         self._steps_taken += 1
         return action  # (num_envs, action_dim)
