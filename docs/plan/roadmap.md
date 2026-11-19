@@ -4,23 +4,33 @@ This folder tracks our active design documents and execution plans for the Diffu
 
 ---
 
+## Current Status (2026-11-19)
+- **Local Pipeline & Verification:** `ruff check` passes, `18/18` `pytest` tests pass, and 1-batch end-to-end `pusht_dwm` (`128×128`) training + FP16 `precompute_vae_latents.py --img-size 128` verified cleanly.
+- **HuggingFace Subset Datasets Live:** [`Hanifanrn/pusht-5k`](https://huggingface.co/datasets/Hanifanrn/pusht-5k) (`5,000` episodes, `9.2 GB`) and [`Hanifanrn/antmaze-10k`](https://huggingface.co/datasets/Hanifanrn/antmaze-10k) (`10,000` episodes, `9.5 GB`, `zstd`) wired into `scripts/download_datasets.sh`.
+- **Kaggle Push-T Run 1 (`rightfel/pusht`) Findings & Fixes:**
+  - *Baseline run (`224×224`, `5` epochs / `5,000` steps, `parallel` `GradientSolver`):* finished `0/10` (`0.0%`) in `~10h` (`eval_gd` took `25,373s` / `7.05h`).
+  - *Diagnostics on downloaded checkpoint (`outputs/kaggle_pusht`):* `Identity copy MSE = 0.0328` vs `Model ODE MSE = 0.0253` and `Action sensitivity MSE = 0.000047` — the short `224×224` pixel-only run froze the T-block, dropped the small blue agent dot, and `parallel` `horizon=15` read untrained `temporal_pos_embed[:, 4:]`.
+  - *Fixes implemented (ready for Kaggle Run 2):* Push-T `128×128` (`64` patches + FP16 precomputed latents `~1.2 GB`), `use_proprio: true` (`4-D` agent state supervision; `proprio_cost_weight: 0.0` at eval), spatial `use_action_token: true`, `h_ctx ∈ [1..3]` context training in `_sample_training_tau`, `autoregressive` eval + `CEMSolver` default, and single-level `_ode_step` checkpointing + MemEff SDPA.
+
+---
+
 ## Phase 1: Core Diffusion World Model — DONE
 See [diffusion_wm_plan.md](./diffusion_wm_plan.md).
 - Self-contained repo with `uv`, `stable_worldmodel`, `GradientSolver`, and `CEMSolver`.
-- `SDVAEWrapper` (`stabilityai/sd-vae-ft-mse`) + `SpatioTemporalDiT` (with 27-D proprio token for AntMaze) + `DiffusionWorldModel` (Rectified Flow + Diffusion Forcing).
-- Training (`diffusion_wm/train.py`), evaluation (`diffusion_wm/eval.py`), and presentation visuals (`diffusion_wm/visualize.py`).
-- Verified locally with 14 `pytest` unit/smoke tests and `ruff check`.
+- `SDVAEWrapper` (`stabilityai/sd-vae-ft-mse`) + `SpatioTemporalDiT` (with spatial `action_token`, `4-D` proprio token on Push-T, and `27-D` proprio token on AntMaze) + `DiffusionWorldModel` (Rectified Flow + Diffusion Forcing).
+- Training (`diffusion_wm/train.py`), evaluation (`diffusion_wm/eval.py`), latent precomputation (`scripts/precompute_vae_latents.py`), and presentation visuals (`diffusion_wm/visualize.py`).
+- Verified locally with `18` `pytest` unit/smoke/visual tests and `ruff check`.
 
 ---
 
 ## Phase 2: Kaggle Training, Evaluation & Presentation — IN PROGRESS
-1. **Push-T (`notebooks/kaggle_pusht.ipynb`)**
-   - Train `pusht_dwm` (`MAX_EPOCHS=5`, `LIMIT_TRAIN_BATCHES=1000`, `16-mixed` precision).
-   - Evaluate with `GradientSolver` (`pusht_gd`) and `CEMSolver` (`pusht_cem`).
-   - Collect `training_curves.png`, `world_model_dreams_ep*.png`, `eval_summary.png`, and `rollout_ep*.gif` for presentation.
-2. **Visual AntMaze (`notebooks/kaggle_antmaze.ipynb`)**
-   - Train `ant_dwm` (joint visual `4x8x8` + 27-D proprioception diffusion).
-   - Evaluate with `ant_gd` and `ant_cem`, and collect dream + rollout visuals.
+1. **Push-T (`notebooks/kaggle_pusht.ipynb`) — READY FOR RUN 2**
+   - Precompute `128×128` SD-VAE latents (`~1.2 GB` on `Hanifanrn/pusht-5k`), train `pusht_dwm` (`MAX_EPOCHS=15`, `LIMIT_TRAIN_BATCHES=2000`, `BATCH_SIZE=64`, `lr=2e-4`, `16-mixed`, `use_proprio=true`, `use_action_token=true`).
+   - Evaluate with fast `autoregressive` `CEMSolver` (`pusht_cem`, `10` tasks) and optional `pusht_gd`.
+   - Inspect `world_model_dreams_ep*.png` (verify moving agent dot + T-block physics), `training_curves.png`, `eval_summary.png`, and `rollout_ep0.gif`.
+2. **Visual AntMaze (`notebooks/kaggle_antmaze.ipynb`) — QUEUED AFTER PUSH-T**
+   - Train `ant_dwm` on `Hanifanrn/antmaze-10k` (joint visual `4x8x8` + `27-D` proprioception diffusion).
+   - Evaluate with `autoregressive` `ant_cem` / `ant_gd`, and collect dream + rollout visuals.
 
 ---
 

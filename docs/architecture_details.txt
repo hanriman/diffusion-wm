@@ -3,18 +3,18 @@ DIFFUSION WORLD MODEL — ARCHITECTURE DETAILS
 
 Repository: diffusion-wm
 Environments:
-  - Push-T (swm/PushT-v1): 224x224 RGB pixels, 2D action (10-D stacked over frameskip=5)
+  - Push-T (swm/PushT-v1): 128x128 RGB pixels + 4-D agent proprioception, 2D action (10-D stacked over frameskip=5)
   - Visual AntMaze (swm/OGBAntMaze-v0): 64x64 RGB pixels + 27-D proprioception (qpos[2:], qvel),
     8D action (40-D stacked over frameskip=5)
 
 --------------------------------------------------------------------------------
 1. PARAMETER BREAKDOWN (Push-T Example)
 --------------------------------------------------------------------------------
-  Total parameters         : ~106 M (107 M)
+  Total parameters         : ~107 M
   - Frozen (Non-trainable) :  83.7 M  -> SDVAEWrapper (stabilityai/sd-vae-ft-mse)
-      * Encoder (~34 M)    :  Runs under torch.no_grad() to compress RGB -> 4xH'xW' latents
+      * Encoder (~34 M)    :  Runs once during precomputation or under torch.no_grad()
       * Decoder (~49 M)    :  NOT called during training or MPC cost; used only for visuals
-  - Trainable              :  23.3 M  -> DiffusionWorldModel dynamics (SpatioTemporalDiT + action_embed)
+  - Trainable              :  24.0 M  -> DiffusionWorldModel dynamics (SpatioTemporalDiT + action/proprio)
 
 Why freeze the SD-VAE?
   stabilityai/sd-vae-ft-mse is already pretrained on millions of images to compress and
@@ -29,7 +29,7 @@ Why freeze the SD-VAE?
   - Input: ImageNet-normalized RGB tensor (B, T, 3, H, W)
   - Preprocessing: un-normalizes ImageNet stats back to [-1, 1]
   - Encoding: AutoencoderKL.encode(...).latent_dist.mode() * 0.18215
-      * Push-T (224x224)  -> (B, T, 4, 28, 28)
+      * Push-T (128x128)  -> (B, T, 4, 16, 16)
       * AntMaze (64x64)   -> (B, T, 4, 8, 8)
   - Decoding: AutoencoderKL.decode(z / 0.18215).sample -> [0, 1] RGB (visualization only)
 
@@ -43,11 +43,15 @@ Why freeze the SD-VAE?
 
 (C) SpatioTemporalDiT (diffusion_wm/models/dit.py)
   - Patchification:
-      * Push-T  (patch_size=2 on 4x28x28): 14x14 = 196 visual tokens, patch_dim = 4*2*2 = 16
-      * AntMaze (patch_size=1 on 4x8x8)  :  8x8  =  64 visual tokens, patch_dim = 4*1*1 = 4
-  - Proprioception Token (AntMaze only, use_proprio=True):
-      * Normalized 27-D proprio -> MLP(27 -> 384 -> 384) -> 1 token appended per frame
-      * Total tokens per frame on AntMaze = 64 + 1 = 65
+      * Push-T  (patch_size=2 on 4x16x16): 8x8 = 64 visual tokens, patch_dim = 4*2*2 = 16
+      * AntMaze (patch_size=1 on 4x8x8)  : 8x8 = 64 visual tokens, patch_dim = 4*1*1 = 4
+  - Conditioning Tokens:
+      * Proprioception Token (use_proprio=True):
+          - Push-T: 4-D agent [x, y, vx, vy] -> 1 token (training supervision; proprio_cost_weight=0 at eval)
+          - AntMaze: 27-D [qpos[2:], qvel] -> 1 token (training + eval)
+      * Action Token (use_action_token=True on Push-T):
+          - 1 token appended per frame so spatial patches directly attend to the transition action
+      * Total tokens per frame: Push-T = 64 + 1 + 1 = 66; AntMaze = 64 + 1 = 65
   - Positional Embeddings:
       * Learnable 2D spatial_pos_embed: (1, 1, num_tokens, 384)
       * Learnable 1D temporal_pos_embed: (1, max_seq_len=32, 1, 384)
@@ -67,11 +71,11 @@ Why freeze the SD-VAE?
 --------------------------------------------------------------------------------
 3. TRAINING & EVALUATION HYPERPARAMETERS
 --------------------------------------------------------------------------------
-  Dataset clip length : num_steps = 4 (history_size=3 context + rollout_n=1 target), frameskip=5
-  Training objective  : Diffusion Forcing Rectified Flow velocity MSE loss
-  Optimizer           : AdamW (lr=1e-4, weight_decay=1e-3, cosine schedule with 5% warmup)
+  Dataset clip length : num_steps = 4 (randomized h_ctx in 1..3), frameskip=5
+  Training objective  : Diffusion Forcing Rectified Flow velocity MSE loss (+ proprio MSE)
+  Optimizer           : AdamW (Push-T lr=2e-4, AntMaze lr=1e-4, weight_decay=1e-3, cosine + 5% warmup)
   MPC Evaluation:
     - Push-T  : horizon=15, receding_horizon=2, action_block=5, cost_last_n=2, eval_budget=90
     - AntMaze : horizon=23, receding_horizon=2, action_block=5, cost_last_n=2, eval_budget=350
-    - ODE Rollout: num_ode_steps=4 (Euler or Midpoint), rollout_mode=parallel or autoregressive
-    - Solvers: GradientSolver (backprop through 4 ODE steps) and CEMSolver / MPPI (gradient-free)
+    - ODE Rollout: num_ode_steps=4 (Euler or Midpoint), rollout_mode=autoregressive (default for num_steps=4) or parallel
+    - Solvers: CEMSolver / MPPI (default on Kaggle, no_grad) and GradientSolver (chunked + single-level checkpointed)

@@ -72,17 +72,15 @@ Diffusion Forcing assigns each frame t its OWN flow time tau_t in [0, 1], paired
 Causal Temporal Attention (is_causal=True, so frame t only attends to frames <= t):
 
 In `_sample_training_tau` (diffusion_wm/models/diffusion_wm.py):
-  - History frames (t < history_size=3):
-      tau_t ~ Uniform(1 - ctx_noise_std, 1.0) = [0.95, 1.0]
-      Adding a tiny 5% stabilization noise to context frames teaches the model not to break
-      when conditioned on slightly imperfect predicted frames during long rollouts.
-  - Future / Target frames:
-      * 50% of the batch uses SYNCHRONIZED tau across future frames:
-        teaches the model to denoise an entire multi-step future horizon simultaneously in
-        parallel (`rollout_mode="parallel"`).
-      * 50% of the batch uses INDEPENDENT tau_t per future frame:
-        teaches the model to predict step-by-step and handle varying uncertainty across time
-        (`rollout_mode="autoregressive"`).
+  - Context length per sample is spread evenly across c_len in 1..min(history_size, seq_len-1):
+      * Trains both 1-frame eval starts (c_len=1) and multi-frame context windows (c_len=2, 3),
+        while supervising ~2x more future frames per batch than fixed c_len=3.
+      * Context frames (t < c_len): tau_t ~ Uniform(1 - ctx_noise_std, 1.0) = [0.95, 1.0],
+        stabilizing rollouts against small multi-step prediction drift.
+  - Future / Target frames (t >= c_len):
+      * 50% of the batch uses SYNCHRONIZED tau across future frames (`rollout_mode="parallel"`).
+      * 50% of the batch uses INDEPENDENT tau_t per future frame (`rollout_mode="autoregressive"`,
+        default at eval for num_steps=4 models so sliding windows stay within trained temporal_pos_embed[:, :4]).
 
 --------------------------------------------------------------------------------
 4. DIFFERENTIABLE PLANNING THROUGH THE DIFFUSION ODE (GradientSolver)
