@@ -16,7 +16,7 @@ data:
       - state
     level1:
       frameskip: 5
-      num_steps: 4
+      num_steps: 8
 output_model_name: pusht_dwm
 env: pusht
 subdir: ${env}/${output_model_name}/seed${seed}
@@ -69,7 +69,7 @@ wm:
   proprio_dim: 4
   proprio_loss_weight: 1.0
   proprio_cost_weight: 0.0
-  ctx_noise_std: 0.05
+  ctx_noise_std: 0.10
   num_ode_steps: 4
   ode_solver: euler
   rollout_mode: parallel
