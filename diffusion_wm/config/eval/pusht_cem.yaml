@@ -18,7 +18,7 @@ dataset:
 seed: 42
 policy: null
 dump_eval_trajs_path: null
-load_eval_trajs_path: assets/eval_trajs/pusht/goal_offset_75_val.pt
+load_eval_trajs_path: assets/eval_trajs/pusht/goal_offset_40_val.pt
 model_overrides:
   num_ode_steps: 4
   ode_solver: euler
@@ -28,12 +28,12 @@ model_overrides:
   grad_checkpoint_rollout: false
   grad_checkpoint_blocks: false
   eval_autocast: true
-  proprio_cost_weight: 0.0
+  proprio_cost_weight: 0.02
 solver:
   _target_: stable_worldmodel.solver.CEMSolver
   model: ???
-  n_steps: 5
-  num_samples: 128
+  n_steps: 8
+  num_samples: 256
   num_elites: 32
   var_scale: 1.0
   min_std: 0.05
@@ -44,15 +44,15 @@ solver:
   device: cuda
   seed: ${seed}
 plan_config:
-  horizon: 3
+  horizon: 7
   receding_horizon: 1
   action_block: 5
-  cost_last_n: 1
+  cost_last_n: 2
 eval:
   num_eval: 10
   chunk_size: 1
-  goal_offset_steps: 75
-  eval_budget: 90
+  goal_offset_steps: 40
+  eval_budget: 80
   img_size: 128
   dataset_name: pusht_expert_train
   callables:

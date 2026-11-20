@@ -22,21 +22,21 @@ load_eval_trajs_path: assets/eval_trajs/pusht/goal_offset_40_val.pt
 model_overrides:
   num_ode_steps: 4
   ode_solver: euler
-  rollout_mode: autoregressive
+  rollout_mode: parallel
   rollout_noise_scale: 0.0
   rollout_batch_size: 32
   grad_checkpoint_rollout: true
   grad_checkpoint_blocks: false
   eval_autocast: true
-  proprio_cost_weight: 0.1
+  proprio_cost_weight: 0.02
 solver:
   _target_: stable_worldmodel.solver.GradientSolver
   model: ???
-  n_steps: 25
-  min_its: 12
+  n_steps: 35
+  min_its: 15
   batch_size: 1
   var_scale: 1.0
-  num_samples: 24
+  num_samples: 96
   action_noise: 0.0
   action_clip_sigma: 3.0
   device: cuda
@@ -47,15 +47,15 @@ solver:
   optimizer_kwargs:
     lr: 0.1
 plan_config:
-  horizon: 8
-  receding_horizon: 2
+  horizon: 7
+  receding_horizon: 1
   action_block: 5
   cost_last_n: 2
 eval:
   num_eval: 10
   chunk_size: 1
   goal_offset_steps: 40
-  eval_budget: 60
+  eval_budget: 80
   img_size: 128
   dataset_name: pusht_expert_train
   callables:

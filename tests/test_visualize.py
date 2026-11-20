@@ -189,6 +189,132 @@ def test_dreams_and_rollout_visuals_pusht(tmp_path: Path):
     assert any(p.suffix == '.png' and p.exists() for p in rollout_paths)
 
 
+def test_ode_history_and_interactive_demo_html(tmp_path: Path):
+    from diffusion_wm.demo import (
+        build_counterfactual_section,
+        record_closed_loop_demo,
+        write_interactive_demo_html,
+    )
+
+    state_seq = torch.tensor(
+        [[250.0, 250.0, 250.0, 250.0, 0.5, 0.0, 0.0]] * 40, dtype=torch.float32
+    )
+    ep = {
+        'pixels': torch.randint(0, 255, (40, 3, 64, 64), dtype=torch.uint8),
+        'action': torch.randn(40, 2),
+        'proprio': torch.randn(40, 4),
+        'state': state_seq,
+    }
+    trajs_path = tmp_path / 'eval_pusht.pt'
+    torch.save(
+        {'data': [ep], 'columns': list(ep.keys()), 'episodes_idx': [0]},
+        trajs_path,
+    )
+
+    vae = TinyConvVAE(hidden_dim=8, freeze=True)
+    dit = SpatioTemporalDiT(
+        latent_channels=4,
+        latent_height=8,
+        latent_width=8,
+        patch_size=2,
+        hidden_dim=32,
+        depth=2,
+        heads=2,
+        dim_head=16,
+        mlp_ratio=2.0,
+        max_seq_len=16,
+        use_proprio=True,
+        proprio_dim=4,
+        use_action_token=True,
+    )
+    model = DiffusionWorldModel(
+        vae=vae,
+        dit=dit,
+        history_size=2,
+        action_dim=2,
+        frameskip=2,
+        use_proprio=True,
+        proprio_dim=4,
+        num_ode_steps=2,
+    ).eval()
+
+    ctx_vis = torch.randn(1, 1, 4, 8, 8)
+    act = torch.randn(1, 3, 4)
+    ctx_p = torch.randn(1, 1, 4)
+    for mode in ('parallel', 'autoregressive'):
+        fn = (
+            model.sample_ode_parallel
+            if mode == 'parallel'
+            else model.sample_ode_autoregressive
+        )
+        vis, _, hist = fn(ctx_vis, act, ctx_proprio=ctx_p, num_ode_steps=3, return_history=True)
+        assert vis.shape == (1, 4, 4, 8, 8)
+        assert len(hist) == 4
+        assert hist[0][0] == 0.0 and hist[-1][0] == 1.0
+        assert all(z.shape == (1, 3, 4, 8, 8) for _, z in hist)
+
+    eval_cfg = OmegaConf.create(
+        {
+            'world': {'env_name': 'swm/PushT-v1', 'history_size': 1, 'frame_skip': 1},
+            'load_eval_trajs_path': str(trajs_path),
+            'model_overrides': {'rollout_mode': 'parallel', 'num_ode_steps': 2},
+            'solver': {
+                '_target_': 'stable_worldmodel.solver.CEMSolver',
+                'n_steps': 1,
+                'num_samples': 4,
+                'num_elites': 2,
+                'device': 'cpu',
+                'seed': 42,
+            },
+            'plan_config': {'horizon': 2, 'receding_horizon': 1, 'action_block': 2, 'cost_last_n': 1},
+            'eval': {
+                'num_eval': 1,
+                'goal_offset_steps': 10,
+                'eval_budget': 2,
+                'img_size': 64,
+                'callables': [
+                    {'method': '_set_state', 'args': {'state': {'value': 'state'}}},
+                    {'method': '_set_goal_state', 'args': {'goal_state': {'value': 'goal_state'}}},
+                ],
+            },
+        }
+    )
+    process = {
+        k: _DummyScaler(dim)
+        for k, dim in (('action', 2), ('proprio', 4), ('state', 7), ('goal_proprio', 4), ('goal_state', 7))
+    }
+    payload = torch.load(trajs_path, map_location='cpu', weights_only=False)
+    cf = build_counterfactual_section(
+        eval_cfg, model, process, payload, episode_idx=0, horizon=2, num_ode_steps=2, img_size=64
+    )
+    assert len(cf['presets']) == 5
+    assert '1.0' in cf['presets'][0]['by_noise']
+
+    cl = record_closed_loop_demo(
+        eval_cfg, model, process, payload, [(0, None)], num_ode_steps=2, max_steps=2, img_size=64
+    )
+    assert len(cl) == 1 and len(cl[0]['steps']) >= 1 and len(cl[0]['replans']) >= 1
+
+    # Also test end-to-end HTML writer with saved checkpoint + normalizer
+    ckpt_dir = tmp_path / 'ckpt'
+    ckpt_dir.mkdir()
+    ckpt_path = ckpt_dir / 'test_object.ckpt'
+    torch.save(model, ckpt_path)
+    save_normalizer_artifact(
+        {
+            'format': 'lejepa_training_normalizer_v1',
+            'stats': {
+                'action': {'mean': np.zeros((1, 2)), 'std': np.ones((1, 2)), 'count': 1},
+                'proprio': {'mean': np.zeros((1, 4)), 'std': np.ones((1, 4)), 'count': 1},
+                'state': {'mean': np.zeros((1, 7)), 'std': np.ones((1, 7)), 'count': 1},
+            },
+        },
+        ckpt_dir,
+    )
+    assert write_interactive_demo_html.__name__ == 'write_interactive_demo_html'
+
+
+
 class _DummyScaler:
     def __init__(self, dim: int):
         self.mean_ = np.zeros(dim)

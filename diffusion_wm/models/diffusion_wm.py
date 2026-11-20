@@ -486,7 +486,11 @@ class DiffusionWorldModel(nn.Module):
         ctx_actions: torch.Tensor | None = None,
         init_vis: torch.Tensor | None = None,
         init_p: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return_history: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, list[tuple[float, torch.Tensor]]]
+    ):
         """Denoise all `T_plan` future steps in parallel in `K` ODE steps.
 
         Args:
@@ -498,10 +502,12 @@ class DiffusionWorldModel(nn.Module):
                 for `H_ctx > 1`.
             init_vis: Optional pre-drawn initial noise `(N, T_plan, 4, H', W')`.
             init_p: Optional pre-drawn initial proprio noise `(N, T_plan, proprio_dim)`.
+            return_history: When True, also return a list of `(tau, z_fut_vis)` snapshots
+                for `tau = 0.0 .. 1.0`.
 
         Returns:
             `(pred_vis, pred_proprio)` containing the full trajectory of length
-            `H_ctx + T_plan`.
+            `H_ctx + T_plan` (and optional `ode_history` when `return_history=True`).
         """
         k_steps = max(1, int(num_ode_steps or self.num_ode_steps))
         n_batch, h_ctx, c, hp, wp = ctx_vis.shape
@@ -539,9 +545,12 @@ class DiffusionWorldModel(nn.Module):
         use_ckpt = bool(getattr(self, 'grad_checkpoint_rollout', True)) and (
             torch.is_grad_enabled()
         )
+        history: list[tuple[float, torch.Tensor]] = []
 
         for step_idx in range(k_steps):
             t_val = float(step_idx) * dt
+            if return_history:
+                history.append((t_val, z_vis_seq[:, h_ctx:].detach().clone()))
             tau_seq = torch.cat(
                 [
                     torch.ones((n_batch, h_ctx), device=device, dtype=torch.float32),
@@ -561,6 +570,9 @@ class DiffusionWorldModel(nn.Module):
                 use_ckpt=use_ckpt,
             )
 
+        if return_history:
+            history.append((1.0, z_vis_seq[:, h_ctx:].detach().clone()))
+            return z_vis_seq, z_p_seq, history
         return z_vis_seq, z_p_seq
 
     def sample_ode_autoregressive(
@@ -573,7 +585,11 @@ class DiffusionWorldModel(nn.Module):
         ctx_actions: torch.Tensor | None = None,
         init_vis: torch.Tensor | None = None,
         init_p: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return_history: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor | None, list[tuple[float, torch.Tensor]]]
+    ):
         """Denoise future steps sequentially one frame at a time with sliding context."""
         k_steps = max(1, int(num_ode_steps or self.num_ode_steps))
         hs = max(1, int(history_size or self.history_size))
@@ -602,6 +618,9 @@ class DiffusionWorldModel(nn.Module):
         use_ckpt = bool(getattr(self, 'grad_checkpoint_rollout', True)) and (
             torch.is_grad_enabled()
         )
+        per_step_hist: list[list[torch.Tensor]] = (
+            [[] for _ in range(k_steps + 1)] if return_history else []
+        )
 
         for step_t in range(t_plan):
             win_vis = vis_traj[:, -hs:]
@@ -628,6 +647,8 @@ class DiffusionWorldModel(nn.Module):
             cur_act_emb = torch.cat([win_act_emb, next_act_emb], dim=1)
 
             for k in range(k_steps):
+                if return_history:
+                    per_step_hist[k].append(cur_vis_seq[:, -1:].detach().clone())
                 tau_seq = torch.cat(
                     [
                         torch.ones(
@@ -652,11 +673,22 @@ class DiffusionWorldModel(nn.Module):
                     use_ckpt=use_ckpt,
                 )
 
+            if return_history:
+                per_step_hist[k_steps].append(cur_vis_seq[:, -1:].detach().clone())
             vis_traj = torch.cat([vis_traj, cur_vis_seq[:, -1:]], dim=1)
             if self.use_proprio and p_traj is not None and cur_p_seq is not None:
                 p_traj = torch.cat([p_traj, cur_p_seq[:, -1:]], dim=1)
             past_act_embs = torch.cat([past_act_embs, next_act_emb], dim=1)
 
+        if return_history:
+            history = [
+                (
+                    1.0 if k == k_steps else float(k) * dt,
+                    torch.cat(per_step_hist[k], dim=1),
+                )
+                for k in range(k_steps + 1)
+            ]
+            return vis_traj, p_traj, history
         return vis_traj, p_traj
 
     def rollout(
