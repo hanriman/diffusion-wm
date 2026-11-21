@@ -6,6 +6,7 @@ import argparse
 import base64
 import io
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -889,17 +890,125 @@ def launch_live_demo(
     _render()
 
 
+def serve_live_worker(
+    *,
+    eval_config_name: str,
+    policy_path: str | Path,
+    cache_dir: str | Path | None = None,
+    panel_size: int = 192,
+) -> None:
+    """Persistent stdin/stdout JSON server inside `.venv` for interactive Kaggle widgets."""
+    ckpt_path = resolve_model_checkpoint_path(policy_path, cache_dir)
+    cfg = load_eval_config(config_name=eval_config_name)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
+    cfg.policy = str(ckpt_path)
+    if cache_dir is not None:
+        cfg.cache_dir = str(cache_dir)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = swm.policy.AutoCostModel(str(ckpt_path), cache_dir).to(device).eval()
+    _apply_model_overrides(model, cfg)
+    process = _build_eval_process_from_policy_normalizer(cfg, model=model)
+    payload = torch.load(
+        _resolve_existing_path(cfg.load_eval_trajs_path),
+        map_location='cpu',
+        weights_only=False,
+    )
+    tx = img_transform(cfg)
+    frameskip = int(getattr(model, 'frameskip', 5))
+    horizon = int(cfg.plan_config.horizon)
+
+    print(
+        json.dumps({
+            'ready': True,
+            'max_ep': len(payload['data']) - 1,
+            'horizon': horizon,
+            'device': device,
+        }),
+        flush=True,
+    )
+
+    for line in sys.stdin:
+        raw = line.strip()
+        if not raw:
+            continue
+        req = json.loads(raw)
+        if req.get('cmd') == 'quit':
+            break
+        ep_i = min(max(0, int(req.get('ep', 0))), len(payload['data']) - 1)
+        ax = float(req.get('ax', 0.0))
+        ay = float(req.get('ay', -0.5))
+        steps = max(1, int(req.get('steps', 8)))
+        sigma = float(req.get('sigma', 1.0))
+
+        ep = payload['data'][ep_i]
+        h = min(horizon, max(1, (ep['pixels'].size(0) - 1) // frameskip))
+        px0 = tx(ep['pixels'][0]).unsqueeze(0).unsqueeze(0).to(device)
+        g_idx = ep['pixels'].size(0) - 1
+        gpx = tx(ep['pixels'][g_idx]).unsqueeze(0).unsqueeze(0).to(device)
+        ctx_p = None
+        if getattr(model, 'use_proprio', False) and 'proprio' in ep:
+            p0 = np.asarray(ep['proprio'][0:1])
+            if 'proprio' in process:
+                p0 = process['proprio'].transform(p0)
+            ctx_p = torch.from_numpy(p0).float().unsqueeze(0).to(device)
+
+        raw_act = np.tile(
+            np.array([[ax, ay]], dtype=np.float32), (h * frameskip, 1)
+        )
+        act_norm = process['action'].transform(raw_act) if 'action' in process else raw_act
+        act_t = torch.from_numpy(act_norm.reshape(1, h, -1)).float().to(device)
+        with torch.no_grad():
+            ctx_vis = model.vae.encode(px0)
+            goal_vis = model.vae.encode(gpx)
+            _, _, hist = _rollout_with_history(
+                model,
+                ctx_vis,
+                act_t,
+                ctx_proprio=ctx_p,
+                num_ode_steps=steps,
+                noise_scale=sigma,
+            )
+            ctx_u8 = _tensor_01_to_uint8(model.decode_pixels(ctx_vis[0])[0])
+            goal_u8 = _tensor_01_to_uint8(model.decode_pixels(goal_vis[0])[0])
+
+        ctx_arrow = _draw_action_arrow(ctx_u8, ax, ay, size=panel_size)
+        taus, frames_b64 = _decode_ode_history(model, hist, img_size=panel_size)
+        print(
+            json.dumps({
+                'ctx': _encode_png_b64(ctx_arrow, size=panel_size),
+                'goal': _encode_png_b64(goal_u8, size=panel_size),
+                'taus': taus,
+                'frames': frames_b64,
+                'horizon': h,
+            }),
+            flush=True,
+        )
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Generate offline HTML interactive Diffusion WM demo.')
+    parser = argparse.ArgumentParser(description='Generate offline HTML or serve live Diffusion WM demo.')
     parser.add_argument('--eval-config', type=str, required=True)
     parser.add_argument('--policy', type=str, required=True)
-    parser.add_argument('--out-path', type=str, required=True)
+    parser.add_argument('--out-path', type=str, default=None)
     parser.add_argument('--eval-dir', type=str, default=None)
     parser.add_argument('--cache-dir', type=str, default=None)
     parser.add_argument('--episodes', type=int, nargs='*', default=None)
     parser.add_argument('--num-ode-steps', type=int, default=8)
     parser.add_argument('--max-rollout-steps', type=int, default=None)
+    parser.add_argument('--serve', action='store_true')
     args = parser.parse_args()
+
+    if args.serve:
+        serve_live_worker(
+            eval_config_name=args.eval_config,
+            policy_path=args.policy,
+            cache_dir=args.cache_dir,
+        )
+        return
+
+    if not args.out_path:
+        parser.error('--out-path is required unless --serve is specified.')
 
     out_file = write_interactive_demo_html(
         eval_config_name=args.eval_config,

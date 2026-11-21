@@ -314,6 +314,98 @@ def test_ode_history_and_interactive_demo_html(tmp_path: Path):
     assert write_interactive_demo_html.__name__ == 'write_interactive_demo_html'
 
 
+def test_serve_live_worker_roundtrip(tmp_path: Path, monkeypatch):
+    import io
+    import json
+
+    from diffusion_wm.demo import serve_live_worker
+
+    state_seq = torch.tensor(
+        [[250.0, 250.0, 250.0, 250.0, 0.5, 0.0, 0.0]] * 26, dtype=torch.float32
+    )
+    ep = {
+        'pixels': torch.randint(0, 255, (26, 3, 64, 64), dtype=torch.uint8),
+        'action': torch.randn(26, 2),
+        'proprio': torch.randn(26, 4),
+        'state': state_seq,
+    }
+    trajs_path = tmp_path / 'eval_pusht.pt'
+    torch.save({'data': [ep], 'columns': list(ep.keys()), 'episodes_idx': [0]}, trajs_path)
+
+    vae = TinyConvVAE(hidden_dim=8, freeze=True)
+    dit = SpatioTemporalDiT(
+        latent_channels=4,
+        latent_height=8,
+        latent_width=8,
+        patch_size=2,
+        hidden_dim=32,
+        depth=2,
+        heads=2,
+        dim_head=16,
+        mlp_ratio=2.0,
+        max_seq_len=16,
+        use_proprio=True,
+        proprio_dim=4,
+        use_action_token=True,
+    )
+    model = DiffusionWorldModel(
+        vae=vae,
+        dit=dit,
+        history_size=2,
+        action_dim=2,
+        frameskip=2,
+        use_proprio=True,
+        proprio_dim=4,
+        num_ode_steps=2,
+    ).eval()
+    ckpt_dir = tmp_path / 'ckpt'
+    ckpt_dir.mkdir()
+    ckpt_path = ckpt_dir / 'test_object.ckpt'
+    torch.save(model, ckpt_path)
+    save_normalizer_artifact(
+        {
+            'format': 'lejepa_training_normalizer_v1',
+            'stats': {
+                'action': {'mean': np.zeros((1, 2)), 'std': np.ones((1, 2)), 'count': 1},
+                'proprio': {'mean': np.zeros((1, 4)), 'std': np.ones((1, 4)), 'count': 1},
+                'state': {'mean': np.zeros((1, 7)), 'std': np.ones((1, 7)), 'count': 1},
+            },
+        },
+        ckpt_dir,
+    )
+
+    cfg = OmegaConf.create(
+        {
+            'world': {'env_name': 'swm/PushT-v1', 'history_size': 1, 'frame_skip': 1},
+            'dataset': {'keys_to_cache': ['action', 'proprio', 'state']},
+            'load_eval_trajs_path': str(trajs_path),
+            'model_overrides': {'rollout_mode': 'parallel', 'num_ode_steps': 2},
+            'solver': {'device': 'cpu'},
+            'plan_config': {'horizon': 3, 'receding_horizon': 1, 'action_block': 2, 'cost_last_n': 1},
+            'eval': {'img_size': 64},
+        }
+    )
+    monkeypatch.setattr('diffusion_wm.demo.load_eval_config', lambda **_kw: cfg)
+
+    fake_in = io.StringIO(
+        json.dumps({'ep': 0, 'ax': 0.3, 'ay': -0.4, 'steps': 2, 'sigma': 1.0})
+        + '\n'
+        + json.dumps({'cmd': 'quit'})
+        + '\n'
+    )
+    fake_out = io.StringIO()
+    monkeypatch.setattr('sys.stdin', fake_in)
+    monkeypatch.setattr('sys.stdout', fake_out)
+
+    serve_live_worker(eval_config_name='pusht_gd', policy_path=ckpt_path, panel_size=64)
+    lines = [json.loads(line) for line in fake_out.getvalue().strip().splitlines()]
+    assert len(lines) == 2
+    assert lines[0]['ready'] is True
+    assert lines[1]['taus'] == [0.0, 0.5, 1.0]
+    assert len(lines[1]['frames']) == 3 and len(lines[1]['frames'][0]) == 3
+    assert lines[1]['ctx'].startswith('data:image/png;base64,')
+
+
 
 class _DummyScaler:
     def __init__(self, dim: int):
