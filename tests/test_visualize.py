@@ -188,6 +188,19 @@ def test_dreams_and_rollout_visuals_pusht(tmp_path: Path):
     assert any(p.suffix == '.gif' and p.exists() for p in rollout_paths)
     assert any(p.suffix == '.png' and p.exists() for p in rollout_paths)
 
+    # Verify selecting a specific episode index works cleanly
+    ep2 = dict(ep)
+    ep_trajs2 = tmp_path / 'eval_pusht_2.pt'
+    torch.save({'data': [ep, ep2], 'columns': list(ep.keys()), 'episodes_idx': [0, 1]}, ep_trajs2)
+    eval_cfg_2 = OmegaConf.create({**OmegaConf.to_container(eval_cfg), 'load_eval_trajs_path': str(ep_trajs2)})
+    ep1_out = tmp_path / 'viz_ep1'
+    ep1_paths = record_closed_loop_rollouts(
+        eval_cfg_2, model, process, ep1_out, episodes=[1], max_steps=3
+    )
+    assert (ep1_out / 'rollout_ep1.gif').exists()
+    assert not (ep1_out / 'rollout_ep0.gif').exists()
+    assert len(ep1_paths) == 2
+
 
 def test_ode_history_and_interactive_demo_html(tmp_path: Path):
     from diffusion_wm.demo import (
@@ -295,6 +308,69 @@ def test_ode_history_and_interactive_demo_html(tmp_path: Path):
     )
     assert len(cl) == 1 and len(cl[0]['steps']) >= 1 and len(cl[0]['replans']) >= 1
 
+    # Verify known_success=True from prior eval does not mask a failed demo re-run
+    far_state = torch.cat(
+        [
+            torch.tensor([[100.0, 100.0, 100.0, 100.0, 0.0, 0.0, 0.0]] * 39),
+            torch.tensor([[400.0, 400.0, 400.0, 400.0, 1.5, 0.0, 0.0]]),
+        ],
+        dim=0,
+    )
+    far_ep = {**ep, 'state': far_state}
+    cl_mismatch = record_closed_loop_demo(
+        eval_cfg,
+        model,
+        process,
+        {'data': [far_ep], 'columns': list(far_ep.keys()), 'episodes_idx': [0]},
+        [(0, True)],
+        num_ode_steps=2,
+        max_steps=1,
+        img_size=64,
+    )
+    assert cl_mismatch[0]['solved'] is False
+    assert cl_mismatch[0]['eval_solved'] is True
+
+    # Also test counterfactual section with 8-DoF AntMaze-like actions
+    ant_dit = SpatioTemporalDiT(
+        latent_channels=4,
+        latent_height=8,
+        latent_width=8,
+        patch_size=2,
+        hidden_dim=32,
+        depth=1,
+        heads=2,
+        dim_head=16,
+        use_proprio=True,
+        proprio_dim=27,
+    )
+    ant_model = DiffusionWorldModel(
+        vae=vae,
+        dit=ant_dit,
+        history_size=2,
+        action_dim=8,
+        frameskip=2,
+        use_proprio=True,
+        proprio_dim=27,
+        num_ode_steps=2,
+    ).eval()
+    ant_ep = {
+        'pixels': torch.randint(0, 255, (10, 3, 64, 64), dtype=torch.uint8),
+        'action': torch.randn(9, 8),
+        'proprio': torch.randn(10, 27),
+    }
+    ant_process = {'action': _DummyScaler(8), 'proprio': _DummyScaler(27)}
+    ant_cf = build_counterfactual_section(
+        eval_cfg,
+        ant_model,
+        ant_process,
+        {'data': [ant_ep]},
+        episode_idx=0,
+        horizon=2,
+        num_ode_steps=2,
+        img_size=64,
+    )
+    assert len(ant_cf['presets']) == 5 and ant_cf['frameskip'] == 2
+
     # Also test end-to-end HTML writer with saved checkpoint + normalizer
     ckpt_dir = tmp_path / 'ckpt'
     ckpt_dir.mkdir()
@@ -312,6 +388,35 @@ def test_ode_history_and_interactive_demo_html(tmp_path: Path):
         ckpt_dir,
     )
     assert write_interactive_demo_html.__name__ == 'write_interactive_demo_html'
+
+
+def test_chunked_eval_fingerprint_changes_on_override():
+    from diffusion_wm.planning_eval import (
+        _chunked_eval_fingerprint,
+        apply_eval_cli_overrides,
+    )
+
+    base = OmegaConf.create(
+        {
+            'policy': '/tmp/a.ckpt',
+            'seed': 42,
+            'solver': {'_target_': 'x', 'num_samples': 32, 'seed': 42},
+            'plan_config': {'horizon': 5},
+            'model_overrides': {'proprio_cost_weight': 0.02},
+            'eval': {'num_eval': 10, 'img_size': 128},
+        }
+    )
+    fp_base = _chunked_eval_fingerprint(base, '/tmp/trajs.pt')
+
+    # Growing num_eval keeps the same prefix fingerprint
+    grown = OmegaConf.create(OmegaConf.to_container(base, resolve=False))
+    grown.eval.num_eval = 50
+    assert _chunked_eval_fingerprint(grown, '/tmp/trajs.pt') == fp_base
+
+    # Changing horizon or num_samples invalidates stale chunk cache
+    changed = OmegaConf.create(OmegaConf.to_container(base, resolve=False))
+    apply_eval_cli_overrides(changed, horizon=4, num_samples=64)
+    assert _chunked_eval_fingerprint(changed, '/tmp/trajs.pt') != fp_base
 
 
 def test_serve_live_worker_roundtrip(tmp_path: Path, monkeypatch):

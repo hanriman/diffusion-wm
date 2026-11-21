@@ -24,8 +24,11 @@ try:
         _build_policy,
         _eval_sdpa_kernel,
         _resolve_existing_path,
+        apply_eval_cli_overrides,
+        get_solver_generators,
         img_transform,
         load_eval_config,
+        seed_solver_for_offset,
     )
     from .utils import resolve_model_checkpoint_path
     from .visualize import _tensor_01_to_uint8
@@ -36,8 +39,11 @@ except ImportError:
         _build_policy,
         _eval_sdpa_kernel,
         _resolve_existing_path,
+        apply_eval_cli_overrides,
+        get_solver_generators,
         img_transform,
         load_eval_config,
+        seed_solver_for_offset,
     )
     from utils import resolve_model_checkpoint_path
     from visualize import _tensor_01_to_uint8
@@ -146,6 +152,35 @@ def _rollout_with_history(
         model.rollout_noise_scale = orig_noise
 
 
+def _tile_2d_action(
+    dx: float, dy: float, total_steps: int, action_dim: int
+) -> np.ndarray:
+    """Tile 2D `(dx, dy)` controls into `(total_steps, action_dim)` (zero-padding extra dims)."""
+    arr = np.zeros((total_steps, action_dim), dtype=np.float32)
+    if action_dim >= 1:
+        arr[:, 0] = float(dx)
+    if action_dim >= 2:
+        arr[:, 1] = float(dy)
+    return arr
+
+
+def _normalize_action_tensor(
+    raw_seq: np.ndarray,
+    process: dict,
+    horizon_steps: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Normalize `(horizon_steps * frameskip, action_dim)` and reshape for DiT rollout."""
+    act_norm = (
+        process['action'].transform(raw_seq) if 'action' in process else raw_seq
+    )
+    return (
+        torch.from_numpy(act_norm.reshape(1, horizon_steps, -1))
+        .float()
+        .to(device)
+    )
+
+
 def _select_demo_episodes(
     payload: dict, eval_dir: str | Path | None, max_eps: int = 2
 ) -> list[tuple[int, bool | None]]:
@@ -179,11 +214,13 @@ def build_counterfactual_section(
     """Precompute `(noise_scale, action_preset, tau, horizon_k)` dreams for Tab 2."""
     ep = payload['data'][min(episode_idx, len(payload['data']) - 1)]
     frameskip = int(getattr(model, 'frameskip', 5))
-    h_steps = min(horizon, max(1, (ep['pixels'].size(0) - 1) // frameskip))
+    max_raw_steps = min(ep['pixels'].size(0) - 1, len(ep['action']))
+    h_steps = min(horizon, max(1, max_raw_steps // frameskip))
     tx = img_transform(cfg)
     device = next(model.parameters()).device
 
-    raw_act_seq = np.asarray(ep['action'][: h_steps * frameskip])
+    raw_act_seq = np.asarray(ep['action'][: h_steps * frameskip], dtype=np.float32)
+    action_dim = int(getattr(model, 'raw_action_dim', raw_act_seq.shape[-1]))
     raw_px_0 = tx(ep['pixels'][0]).unsqueeze(0).unsqueeze(0).to(device)
     goal_idx = ep['pixels'].size(0) - 1
     goal_px = tx(ep['pixels'][goal_idx]).unsqueeze(0).unsqueeze(0).to(device)
@@ -207,24 +244,15 @@ def build_counterfactual_section(
 
     presets: list[tuple[str, np.ndarray]] = [
         ('EXPERT', raw_act_seq),
-        ('UP', np.tile(np.array([[0.0, -0.6]], dtype=np.float32), (h_steps * frameskip, 1))),
-        ('DOWN', np.tile(np.array([[0.0, 0.6]], dtype=np.float32), (h_steps * frameskip, 1))),
-        ('LEFT', np.tile(np.array([[-0.6, 0.0]], dtype=np.float32), (h_steps * frameskip, 1))),
-        ('RIGHT', np.tile(np.array([[0.6, 0.0]], dtype=np.float32), (h_steps * frameskip, 1))),
+        ('UP', _tile_2d_action(0.0, -0.6, h_steps * frameskip, action_dim)),
+        ('DOWN', _tile_2d_action(0.0, 0.6, h_steps * frameskip, action_dim)),
+        ('LEFT', _tile_2d_action(-0.6, 0.0, h_steps * frameskip, action_dim)),
+        ('RIGHT', _tile_2d_action(0.6, 0.0, h_steps * frameskip, action_dim)),
     ]
 
     presets_out = []
     for name, raw_seq in presets:
-        act_norm = (
-            process['action'].transform(raw_seq)
-            if 'action' in process
-            else raw_seq
-        )
-        act_t = (
-            torch.from_numpy(act_norm.reshape(1, h_steps, -1))
-            .float()
-            .to(device)
-        )
+        act_t = _normalize_action_tensor(raw_seq, process, h_steps, device)
         mean_xy = raw_seq.reshape(h_steps, frameskip, -1).mean(axis=1)[:, :2].tolist()
 
         by_noise = {}
@@ -265,6 +293,7 @@ def build_counterfactual_section(
     return {
         'episode_idx': int(episode_idx),
         'horizon': int(h_steps),
+        'frameskip': int(frameskip),
         'ctx_img': _encode_png_b64(gt_u8, size=img_size),
         'goal_img': _encode_png_b64(goal_u8, size=img_size),
         'presets': presets_out,
@@ -341,6 +370,7 @@ def record_closed_loop_demo(
     }
 
     policy = _build_policy(cfg_local, process, transform, model=model)
+    gens = get_solver_generators(getattr(policy, 'solver', None))
     action_block = int(cfg_local.plan_config.get('action_block', 5))
     callables = OmegaConf.to_container(cfg_local.eval.get('callables'), resolve=True)
     ep_idx_all = payload.get('episodes_idx', list(range(len(payload['data']))))
@@ -400,6 +430,7 @@ def record_closed_loop_demo(
 
     recorded_eps: list[dict[str, Any]] = []
     for ep_i, known_success in episodes:
+        seed_solver_for_offset(gens, ep_i)
         state = {'step': 0, 'done': False, 'replans': [], 'steps': []}
         single_chunk = {
             **payload,
@@ -436,7 +467,8 @@ def record_closed_loop_demo(
 
         recorded_eps.append({
             'episode_idx': int(ep_i),
-            'solved': solved if known_success is None else bool(solved or known_success),
+            'solved': bool(solved),
+            'eval_solved': None if known_success is None else bool(known_success),
             'steps_taken': len(state['steps']),
             'action_block': int(action_block),
             'replans': state['replans'],
@@ -478,7 +510,7 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <h1>Diffusion World Model (Push-T) — Interactive Lecture Explorer</h1>
+  <h1>Diffusion World Model (<span id="demo-env-title">World Model</span>) — Interactive Lecture Explorer</h1>
   <div class="sub">Scrub real closed-loop rollouts, multi-step imagined futures (Horizon k), and Rectified Flow ODE denoising (&tau; = 0 &rarr; 1).</div>
   <div class="tabs">
     <button class="tab active" id="tab-mpc" onclick="switchTab('mpc')">1. Closed-Loop MPC (Plan &amp; Act)</button>
@@ -583,12 +615,17 @@ function switchTab(which) {
 }
 
 function initMpc() {
+  if (DATA.env_label) {
+    document.getElementById('demo-env-title').innerText = DATA.env_label;
+  }
   const sel = document.getElementById('mpc-ep');
   sel.innerHTML = '';
   DATA.closed_loop.forEach((ep, i) => {
     const opt = document.createElement('option');
     opt.value = i;
-    opt.text = `Episode ${ep.episode_idx} (${ep.solved ? 'SOLVED in ' + ep.steps_taken + ' steps' : 'Timeout ' + ep.steps_taken + ' steps'})`;
+    const statusText = ep.solved ? ('SOLVED in ' + ep.steps_taken + ' steps') : ('Timeout ' + ep.steps_taken + ' steps');
+    const note = (ep.eval_solved === true && !ep.solved) ? ' [eval solved]' : '';
+    opt.text = `Episode ${ep.episode_idx} (${statusText}${note})`;
     sel.appendChild(opt);
   });
   onEpChange();
@@ -687,7 +724,8 @@ function renderCf() {
   const tauIdx = Math.min(parseInt(document.getElementById('cf-tau').value), data.taus.length - 1);
   const tauVal = data.taus[tauIdx];
 
-  document.getElementById('cf-k-lbl').innerText = `+${kIdx + 1} (${(kIdx + 1) * 5} env steps)`;
+  const fs = cf.frameskip || 5;
+  document.getElementById('cf-k-lbl').innerText = `+${kIdx + 1} (${(kIdx + 1) * fs} env steps)`;
   document.getElementById('cf-tau-lbl').innerText = tauVal.toFixed(2);
   document.getElementById('cf-k-head').innerText = `+${kIdx + 1}`;
   document.getElementById('cf-tau-head').innerText = tauVal.toFixed(2);
@@ -726,6 +764,11 @@ def write_interactive_demo_html(
     num_ode_steps: int = 8,
     max_rollout_steps: int | None = None,
     panel_size: int = 192,
+    num_samples: int | None = None,
+    img_size: int | None = None,
+    horizon: int | None = None,
+    proprio_cost_weight: float | None = None,
+    seed: int | None = None,
 ) -> Path:
     """Generate standalone offline HTML slider demo (`Closed-Loop MPC` + `Diffusion & Counterfactuals`)."""
     ckpt_path = resolve_model_checkpoint_path(policy_path, cache_dir)
@@ -734,6 +777,14 @@ def write_interactive_demo_html(
     cfg.policy = str(ckpt_path)
     if cache_dir is not None:
         cfg.cache_dir = str(cache_dir)
+    apply_eval_cli_overrides(
+        cfg,
+        num_samples=num_samples,
+        img_size=img_size,
+        horizon=horizon,
+        proprio_cost_weight=proprio_cost_weight,
+        seed=seed,
+    )
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = swm.policy.AutoCostModel(str(ckpt_path), cache_dir).to(device).eval()
@@ -770,7 +821,17 @@ def write_interactive_demo_html(
         img_size=panel_size,
     )
 
-    demo_json = json.dumps({'closed_loop': closed_loop, 'counterfactual': counterfactual})
+    raw_env = str(cfg.world.get('env_name', ''))
+    env_label = (
+        'Push-T'
+        if 'pusht' in raw_env.lower()
+        else ('AntMaze' if 'ant' in raw_env.lower() else raw_env or 'World Model')
+    )
+    demo_json = json.dumps({
+        'env_label': env_label,
+        'closed_loop': closed_loop,
+        'counterfactual': counterfactual,
+    })
     html_text = _HTML_TEMPLATE.replace('__DEMO_DATA_JSON__', demo_json)
     out_path = Path(out_html_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -807,6 +868,7 @@ def launch_live_demo(
     tx = img_transform(cfg)
     frameskip = int(getattr(model, 'frameskip', 5))
     horizon = int(cfg.plan_config.horizon)
+    action_dim = int(getattr(model, 'raw_action_dim', 2))
 
     cache: dict[tuple, dict[str, Any]] = {}
     out = widgets.Output()
@@ -831,7 +893,7 @@ def launch_live_demo(
             ep = payload['data'][w_ep.value]
             h = min(horizon, max(1, (ep['pixels'].size(0) - 1) // frameskip))
             px0 = tx(ep['pixels'][0]).unsqueeze(0).unsqueeze(0).to(device)
-            g_idx = min(ep['pixels'].size(0) - 1, h * frameskip)
+            g_idx = ep['pixels'].size(0) - 1
             gpx = tx(ep['pixels'][g_idx]).unsqueeze(0).unsqueeze(0).to(device)
             ctx_p = None
             if getattr(model, 'use_proprio', False) and 'proprio' in ep:
@@ -839,9 +901,8 @@ def launch_live_demo(
                 if 'proprio' in process:
                     p0 = process['proprio'].transform(p0)
                 ctx_p = torch.from_numpy(p0).float().unsqueeze(0).to(device)
-            raw_act = np.tile(np.array([[w_ax.value, w_ay.value]], dtype=np.float32), (h * frameskip, 1))
-            act_norm = process['action'].transform(raw_act) if 'action' in process else raw_act
-            act_t = torch.from_numpy(act_norm.reshape(1, h, -1)).float().to(device)
+            raw_act = _tile_2d_action(w_ax.value, w_ay.value, h * frameskip, action_dim)
+            act_t = _normalize_action_tensor(raw_act, process, h, device)
             with torch.no_grad():
                 ctx_vis = model.vae.encode(px0)
                 goal_vis = model.vae.encode(gpx)
@@ -896,6 +957,8 @@ def serve_live_worker(
     policy_path: str | Path,
     cache_dir: str | Path | None = None,
     panel_size: int = 192,
+    img_size: int | None = None,
+    horizon: int | None = None,
 ) -> None:
     """Persistent stdin/stdout JSON server inside `.venv` for interactive Kaggle widgets."""
     ckpt_path = resolve_model_checkpoint_path(policy_path, cache_dir)
@@ -904,6 +967,7 @@ def serve_live_worker(
     cfg.policy = str(ckpt_path)
     if cache_dir is not None:
         cfg.cache_dir = str(cache_dir)
+    apply_eval_cli_overrides(cfg, img_size=img_size, horizon=horizon)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = swm.policy.AutoCostModel(str(ckpt_path), cache_dir).to(device).eval()
@@ -916,13 +980,14 @@ def serve_live_worker(
     )
     tx = img_transform(cfg)
     frameskip = int(getattr(model, 'frameskip', 5))
-    horizon = int(cfg.plan_config.horizon)
+    plan_horizon = int(cfg.plan_config.horizon)
+    action_dim = int(getattr(model, 'raw_action_dim', 2))
 
     print(
         json.dumps({
             'ready': True,
             'max_ep': len(payload['data']) - 1,
-            'horizon': horizon,
+            'horizon': plan_horizon,
             'device': device,
         }),
         flush=True,
@@ -942,7 +1007,7 @@ def serve_live_worker(
         sigma = float(req.get('sigma', 1.0))
 
         ep = payload['data'][ep_i]
-        h = min(horizon, max(1, (ep['pixels'].size(0) - 1) // frameskip))
+        h = min(plan_horizon, max(1, (ep['pixels'].size(0) - 1) // frameskip))
         px0 = tx(ep['pixels'][0]).unsqueeze(0).unsqueeze(0).to(device)
         g_idx = ep['pixels'].size(0) - 1
         gpx = tx(ep['pixels'][g_idx]).unsqueeze(0).unsqueeze(0).to(device)
@@ -953,11 +1018,8 @@ def serve_live_worker(
                 p0 = process['proprio'].transform(p0)
             ctx_p = torch.from_numpy(p0).float().unsqueeze(0).to(device)
 
-        raw_act = np.tile(
-            np.array([[ax, ay]], dtype=np.float32), (h * frameskip, 1)
-        )
-        act_norm = process['action'].transform(raw_act) if 'action' in process else raw_act
-        act_t = torch.from_numpy(act_norm.reshape(1, h, -1)).float().to(device)
+        raw_act = _tile_2d_action(ax, ay, h * frameskip, action_dim)
+        act_t = _normalize_action_tensor(raw_act, process, h, device)
         with torch.no_grad():
             ctx_vis = model.vae.encode(px0)
             goal_vis = model.vae.encode(gpx)
@@ -996,6 +1058,11 @@ def main() -> None:
     parser.add_argument('--episodes', type=int, nargs='*', default=None)
     parser.add_argument('--num-ode-steps', type=int, default=8)
     parser.add_argument('--max-rollout-steps', type=int, default=None)
+    parser.add_argument('--num-samples', type=int, default=None)
+    parser.add_argument('--img-size', type=int, default=None)
+    parser.add_argument('--horizon', type=int, default=None)
+    parser.add_argument('--proprio-cost-weight', type=float, default=None)
+    parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--serve', action='store_true')
     args = parser.parse_args()
 
@@ -1004,6 +1071,8 @@ def main() -> None:
             eval_config_name=args.eval_config,
             policy_path=args.policy,
             cache_dir=args.cache_dir,
+            img_size=args.img_size,
+            horizon=args.horizon,
         )
         return
 
@@ -1019,6 +1088,11 @@ def main() -> None:
         episodes=args.episodes,
         num_ode_steps=args.num_ode_steps,
         max_rollout_steps=args.max_rollout_steps,
+        num_samples=args.num_samples,
+        img_size=args.img_size,
+        horizon=args.horizon,
+        proprio_cost_weight=args.proprio_cost_weight,
+        seed=args.seed,
     )
     print('Generated interactive demo:', out_file)
 

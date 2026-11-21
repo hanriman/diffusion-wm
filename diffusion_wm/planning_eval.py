@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -314,6 +315,76 @@ def _serialize_metrics(metrics: dict) -> dict:
     return metrics_to_save
 
 
+def apply_eval_cli_overrides(
+    cfg: DictConfig,
+    *,
+    num_samples: int | None = None,
+    img_size: int | None = None,
+    horizon: int | None = None,
+    proprio_cost_weight: float | None = None,
+    seed: int | None = None,
+) -> DictConfig:
+    """Apply optional CLI/notebook overrides uniformly across eval, viz, and demo."""
+    if seed is not None:
+        cfg.seed = int(seed)
+        if 'solver' in cfg and cfg.solver is not None:
+            cfg.solver.seed = int(seed)
+    if num_samples is not None:
+        cfg.solver.num_samples = int(num_samples)
+        if 'num_elites' in cfg.solver and cfg.solver.num_elites is not None:
+            cfg.solver.num_elites = min(int(cfg.solver.num_elites), int(num_samples))
+    if img_size is not None and 'eval' in cfg:
+        cfg.eval.img_size = int(img_size)
+    if horizon is not None and 'plan_config' in cfg:
+        cfg.plan_config.horizon = int(horizon)
+    if proprio_cost_weight is not None:
+        if 'model_overrides' not in cfg or cfg.model_overrides is None:
+            cfg.model_overrides = OmegaConf.create({})
+        cfg.model_overrides.proprio_cost_weight = float(proprio_cost_weight)
+    return cfg
+
+
+def get_solver_generators(solver) -> list[tuple[torch.Generator, int]]:
+    """Collect `(torch_gen, base_seed)` pairs across solver levels."""
+    if solver is None:
+        return []
+    solvers = getattr(solver, 'level_solvers', {1: solver})
+    return [
+        (s.torch_gen, int(s.torch_gen.initial_seed()))
+        for s in solvers.values()
+        if hasattr(s, 'torch_gen') and s.torch_gen is not None
+    ]
+
+
+def seed_solver_for_offset(
+    gens: list[tuple[torch.Generator, int]], offset: int
+) -> None:
+    """Reset solver PyTorch RNG generators deterministically for episode/chunk `offset`."""
+    for gen, base_seed in gens:
+        gen.manual_seed(base_seed + int(offset))
+
+
+def _chunked_eval_fingerprint(cfg: DictConfig, load_eval_trajs_path: str) -> str:
+    """Hash resolved eval/solver/model settings to invalidate stale chunk caches."""
+    eval_cfg = OmegaConf.to_container(cfg.eval, resolve=True)
+    if isinstance(eval_cfg, dict):
+        # Allowing num_eval to grow resumes prior chunks safely.
+        eval_cfg.pop('num_eval', None)
+    payload = {
+        'policy': str(cfg.get('policy', '')),
+        'seed': cfg.get('seed'),
+        'load_eval_trajs_path': str(load_eval_trajs_path),
+        'solver': OmegaConf.to_container(cfg.solver, resolve=True),
+        'plan_config': OmegaConf.to_container(cfg.plan_config, resolve=True),
+        'model_overrides': OmegaConf.to_container(
+            cfg.get('model_overrides'), resolve=True
+        ),
+        'eval': eval_cfg,
+    }
+    raw = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+
 def pop_solve_records(solver) -> list:
     if solver is None:
         return []
@@ -354,6 +425,16 @@ def _run_chunked_eval(
     callables = OmegaConf.to_container(cfg.eval.get('callables'), resolve=True)
     chunk_dir = results_dir / 'chunks'
     chunk_dir.mkdir(parents=True, exist_ok=True)
+    fingerprint = _chunked_eval_fingerprint(cfg, load_eval_trajs_path)
+    fp_path = chunk_dir / '.fingerprint'
+    prev_fp = fp_path.read_text().strip() if fp_path.exists() else None
+    if prev_fp != fingerprint:
+        for stale in list(chunk_dir.glob('tasks_*.json')) + list(
+            chunk_dir.glob('tasks_*.tmp')
+        ):
+            stale.unlink(missing_ok=True)
+        fp_path.write_text(fingerprint + '\n')
+
     chunk_paths = {
         s: chunk_dir / f'tasks_{s:03d}-{min(s + chunk_size, n):03d}.json'
         for s in range(0, n, chunk_size)
@@ -366,14 +447,8 @@ def _run_chunked_eval(
         end = min(start + chunk_size, n)
         if policy is None:
             policy = _build_policy(cfg, process, transform, model=model)
-            solver = getattr(policy, 'solver', None)
-            gens = [
-                (s.torch_gen, s.torch_gen.initial_seed())
-                for s in getattr(solver, 'level_solvers', {1: solver}).values()
-                if hasattr(s, 'torch_gen')
-            ]
-        for gen, seed in gens:
-            gen.manual_seed(seed + start)
+            gens = get_solver_generators(getattr(policy, 'solver', None))
+        seed_solver_for_offset(gens, start)
         chunk = {
             **payload,
             'data': [dict(ep) for ep in payload['data'][start:end]],
@@ -477,16 +552,15 @@ def run_planning_eval(
     }
 
     load_eval_trajs_path = cfg.get('load_eval_trajs_path', None)
-    if load_eval_trajs_path:
-        load_eval_trajs_path = str(_resolve_existing_path(load_eval_trajs_path))
+    if not load_eval_trajs_path:
+        raise ValueError(
+            'eval config must specify load_eval_trajs_path for offline trajectory evaluation.'
+        )
+    load_eval_trajs_path = str(_resolve_existing_path(load_eval_trajs_path))
     dump_eval_trajs_path = cfg.get('dump_eval_trajs_path', None)
     dump_eval_only = dump_eval_trajs_path is not None
 
     image_shape = (int(cfg.eval.img_size),) * 2
-
-    dataset = None
-    eval_episodes = None
-    eval_start_idx = None
     process = {}
 
     if not dump_eval_only:
@@ -516,18 +590,12 @@ def run_planning_eval(
             callables = OmegaConf.to_container(
                 cfg.eval.get('callables'), resolve=True
             )
-            start_steps = (
-                eval_start_idx.tolist() if eval_start_idx is not None else None
-            )
-            episodes_idx = (
-                eval_episodes.tolist() if eval_episodes is not None else None
-            )
             metrics = world.evaluate_from_dataset(
-                dataset,
-                start_steps=start_steps,
+                None,
+                start_steps=None,
                 goal_offset_steps=cfg.eval.goal_offset_steps,
                 eval_budget=cfg.eval.eval_budget,
-                episodes_idx=episodes_idx,
+                episodes_idx=None,
                 callables=callables,
                 dump_eval_trajs_path=dump_eval_trajs_path,
                 load_eval_trajs_path=load_eval_trajs_path,

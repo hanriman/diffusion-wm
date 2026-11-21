@@ -54,6 +54,10 @@ def precompute_vae_latents(
 
         target_h = int(img_size) if img_size is not None else h
         target_w = int(img_size) if img_size is not None else w
+        if target_h % 8 != 0 or target_w % 8 != 0:
+            raise ValueError(
+                f'Target image size ({target_h}, {target_w}) must be divisible by 8 for SD-VAE.'
+            )
         lat_shape = (n_total, 4, target_h // 8, target_w // 8)
 
         if 'vae_latents' in f:

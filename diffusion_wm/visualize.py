@@ -25,8 +25,11 @@ try:
         _build_policy,
         _eval_sdpa_kernel,
         _resolve_existing_path,
+        apply_eval_cli_overrides,
+        get_solver_generators,
         img_transform,
         load_eval_config,
+        seed_solver_for_offset,
     )
     from .utils import resolve_model_checkpoint_path
 except ImportError:
@@ -36,8 +39,11 @@ except ImportError:
         _build_policy,
         _eval_sdpa_kernel,
         _resolve_existing_path,
+        apply_eval_cli_overrides,
+        get_solver_generators,
         img_transform,
         load_eval_config,
+        seed_solver_for_offset,
     )
     from utils import resolve_model_checkpoint_path
 
@@ -394,6 +400,7 @@ def record_closed_loop_rollouts(
     out_dir: str | Path,
     *,
     num_episodes: int = 2,
+    episodes: list[int] | None = None,
     max_steps: int | None = None,
 ) -> list[Path]:
     """Run closed-loop MPC episodes and save side-by-side GIFs and storyboards."""
@@ -407,8 +414,12 @@ def record_closed_loop_rollouts(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     payload = torch.load(trajs_path, map_location='cpu', weights_only=False)
-    n_eps = min(int(num_episodes), len(payload['data']))
-    if n_eps <= 0:
+    n_avail = len(payload['data'])
+    if episodes is not None:
+        target_eps = [i for i in episodes if 0 <= i < n_avail]
+    else:
+        target_eps = list(range(min(int(num_episodes), n_avail)))
+    if not target_eps:
         return []
 
     cfg_local = OmegaConf.create(OmegaConf.to_container(cfg, resolve=False))
@@ -428,6 +439,7 @@ def record_closed_loop_rollouts(
     }
 
     policy = _build_policy(cfg_local, process, transform, model=model)
+    gens = get_solver_generators(getattr(policy, 'solver', None))
     latest_imagined: dict[str, np.ndarray | None] = {'rgb': None}
 
     if hasattr(policy, 'solver'):
@@ -451,7 +463,8 @@ def record_closed_loop_rollouts(
     callables = OmegaConf.to_container(cfg_local.eval.get('callables'), resolve=True)
     ep_idx_all = payload.get('episodes_idx', list(range(len(payload['data']))))
 
-    for ep_i in range(n_eps):
+    for ep_i in target_eps:
+        seed_solver_for_offset(gens, ep_i)
         latest_imagined['rgb'] = None
         single_chunk = {
             **payload,
@@ -520,10 +533,15 @@ def generate_presentation_report(
     eval_dir: str | Path | None = None,
     out_dir: str | Path | None = None,
     cache_dir: str | Path | None = None,
+    episodes: list[int] | None = None,
     num_dream_episodes: int = 2,
     num_rollout_videos: int = 2,
     max_rollout_steps: int | None = None,
     num_samples: int | None = None,
+    img_size: int | None = None,
+    horizon: int | None = None,
+    proprio_cost_weight: float | None = None,
+    seed: int | None = None,
 ) -> list[Path]:
     """Generate all training, dream, evaluation summary, and rollout visuals."""
     ckpt_path = resolve_model_checkpoint_path(policy_path, cache_dir)
@@ -536,10 +554,14 @@ def generate_presentation_report(
     cfg.policy = str(ckpt_path)
     if cache_dir is not None:
         cfg.cache_dir = str(cache_dir)
-    if num_samples is not None:
-        cfg.solver.num_samples = int(num_samples)
-        if 'num_elites' in cfg.solver and cfg.solver.num_elites is not None:
-            cfg.solver.num_elites = min(int(cfg.solver.num_elites), int(num_samples))
+    apply_eval_cli_overrides(
+        cfg,
+        num_samples=num_samples,
+        img_size=img_size,
+        horizon=horizon,
+        proprio_cost_weight=proprio_cost_weight,
+        seed=seed,
+    )
 
     generated: list[Path] = []
 
@@ -557,14 +579,19 @@ def generate_presentation_report(
     _apply_model_overrides(model, cfg)
     process = _build_eval_process_from_policy_normalizer(cfg, model=model)
 
-    for ep_i in range(max(0, int(num_dream_episodes))):
+    dream_eps = (
+        episodes
+        if episodes is not None
+        else list(range(max(0, int(num_dream_episodes))))
+    )
+    for ep_i in dream_eps:
         p_dream = visualize_world_model_dreams(
             cfg, model, process, target_out, episode_idx=ep_i
         )
         if p_dream is not None:
             generated.append(p_dream)
 
-    if num_rollout_videos > 0:
+    if num_rollout_videos > 0 or episodes is not None:
         generated.extend(
             record_closed_loop_rollouts(
                 cfg,
@@ -572,6 +599,7 @@ def generate_presentation_report(
                 process,
                 target_out,
                 num_episodes=num_rollout_videos,
+                episodes=episodes,
                 max_steps=max_rollout_steps,
             )
         )
@@ -589,10 +617,15 @@ def main() -> None:
     parser.add_argument('--eval-dir', type=str, default=None)
     parser.add_argument('--out-dir', type=str, default=None)
     parser.add_argument('--cache-dir', type=str, default=None)
+    parser.add_argument('--episodes', type=int, nargs='*', default=None)
     parser.add_argument('--num-dreams', type=int, default=2)
     parser.add_argument('--num-videos', type=int, default=2)
     parser.add_argument('--max-rollout-steps', type=int, default=None)
     parser.add_argument('--num-samples', type=int, default=None)
+    parser.add_argument('--img-size', type=int, default=None)
+    parser.add_argument('--horizon', type=int, default=None)
+    parser.add_argument('--proprio-cost-weight', type=float, default=None)
+    parser.add_argument('--seed', type=int, default=None)
     args = parser.parse_args()
 
     paths = generate_presentation_report(
@@ -602,10 +635,15 @@ def main() -> None:
         eval_dir=args.eval_dir,
         out_dir=args.out_dir,
         cache_dir=args.cache_dir,
+        episodes=args.episodes,
         num_dream_episodes=args.num_dreams,
         num_rollout_videos=args.num_videos,
         max_rollout_steps=args.max_rollout_steps,
         num_samples=args.num_samples,
+        img_size=args.img_size,
+        horizon=args.horizon,
+        proprio_cost_weight=args.proprio_cost_weight,
+        seed=args.seed,
     )
     for p in paths:
         print('Generated:', p)

@@ -867,10 +867,11 @@ class DiffusionWorldModel(nn.Module):
                 k: v[:, 0] for k, v in info_dict.items() if torch.is_tensor(v)
             }
             _goal['pixels'] = _goal['goal']
+            _goal.pop('action', None)
+            _goal.pop('proprio', None)
             for k in list(info_dict.keys()):
                 if k.startswith('goal_') and torch.is_tensor(info_dict[k]):
                     _goal[k[len('goal_') :]] = info_dict[k][:, 0]
-            _goal.pop('action', None)
             with torch.no_grad():
                 _goal = self.encode(_goal)
             info_dict['goal_embed_0'] = _goal['embed_0'][:, -1:].unsqueeze(1)

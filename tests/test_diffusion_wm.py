@@ -530,3 +530,83 @@ def test_planning_overrides_normalization_and_action_bounds():
         eval_budget=10,
     )
     assert (out['actions'] >= -1.0 - 1e-6).all() and (out['actions'] <= 1.0 + 1e-6).all()
+
+
+def test_get_cost_does_not_leak_current_proprio_when_goal_proprio_absent():
+    model = _make_model(
+        img_size=64,
+        patch_size=2,
+        action_dim=2,
+        frameskip=5,
+        use_proprio=True,
+        proprio_dim=4,
+        num_ode_steps=2,
+    ).eval()
+    acts = torch.zeros(1, 2, 2, 10)
+    info_no_goal_p = {
+        'pixels': torch.randn(1, 2, 1, 3, 64, 64),
+        'goal': torch.randn(1, 2, 1, 3, 64, 64),
+        'proprio': torch.ones(1, 2, 1, 4) * 5.0,
+    }
+    cost_a = model.get_cost(info_no_goal_p, acts)
+    assert cost_a.shape == (1, 2)
+    assert 'goal_proprio_0' not in info_no_goal_p
+
+    info_with_goal_p = {
+        'pixels': info_no_goal_p['pixels'].clone(),
+        'goal': info_no_goal_p['goal'].clone(),
+        'proprio': info_no_goal_p['proprio'].clone(),
+        'goal_proprio': torch.ones(1, 2, 1, 4) * -3.0,
+    }
+    model.get_cost(info_with_goal_p, acts)
+    assert 'goal_proprio_0' in info_with_goal_p
+    torch.testing.assert_close(
+        info_with_goal_p['goal_proprio_0'], torch.full((1, 1, 1, 4), -3.0)
+    )
+
+
+def test_dit_raises_clear_error_on_spatial_resolution_mismatch():
+    dit = SpatioTemporalDiT(
+        latent_channels=4,
+        latent_height=8,
+        latent_width=8,
+        patch_size=2,
+        hidden_dim=32,
+        depth=1,
+        heads=2,
+        dim_head=16,
+        action_embed_dim=32,
+    ).eval()
+    bad_latents = torch.randn(1, 2, 4, 16, 16)
+    tau = torch.rand(1, 2)
+    act_emb = torch.randn(1, 2, 32)
+    with pytest.raises(ValueError, match='Expected visual latent spatial shape'):
+        dit(bad_latents, tau, act_emb)
+
+
+def test_model_object_callback_epoch_interval_zero(tmp_path):
+    from diffusion_wm.utils import ModelObjectCallback
+
+    cb = ModelObjectCallback(dirpath=tmp_path, filename='pusht_dwm', epoch_interval=0)
+
+    class _DummyTrainer:
+        is_global_zero = True
+        max_epochs = 2
+        current_epoch = 0
+
+    class _DummyModule:
+        def __init__(self) -> None:
+            self.model = {'weights': 1}
+
+    trainer = _DummyTrainer()
+    pl_mod = _DummyModule()
+
+    cb.on_train_epoch_end(trainer, pl_mod)
+    assert not (tmp_path / 'pusht_dwm_epoch_1_object.ckpt').exists()
+    assert not (tmp_path / 'pusht_dwm_object.ckpt').exists()
+
+    trainer.current_epoch = 1
+    cb.on_train_epoch_end(trainer, pl_mod)
+    cb.on_train_end(trainer, pl_mod)
+    assert not (tmp_path / 'pusht_dwm_epoch_2_object.ckpt').exists()
+    assert (tmp_path / 'pusht_dwm_object.ckpt').exists()

@@ -63,7 +63,7 @@ class ModelObjectCallback(Callback):
         super().__init__()
         self.dirpath = Path(dirpath)
         self.filename = filename
-        self.epoch_interval = max(1, int(epoch_interval))
+        self.epoch_interval = max(0, int(epoch_interval))
         self._saved_final = False
 
     def _save_final(self, trainer, pl_module) -> None:
@@ -80,7 +80,7 @@ class ModelObjectCallback(Callback):
             return
         self.dirpath.mkdir(parents=True, exist_ok=True)
         epoch = trainer.current_epoch + 1
-        if epoch % self.epoch_interval == 0:
+        if self.epoch_interval > 0 and epoch % self.epoch_interval == 0:
             path = self.dirpath / f'{self.filename}_epoch_{epoch}_object.ckpt'
             torch.save(pl_module.model, path)
             logger.info(f'Saved DiffusionWorldModel to {path}')

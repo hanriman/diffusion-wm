@@ -363,6 +363,12 @@ class SpatioTemporalDiT(nn.Module):
             Dictionary with `'v_vis'` `(B, T, C, H', W')` and optionally
             `'v_proprio'` `(B, T, proprio_dim)`.
         """
+        if z_vis.shape[-2:] != (self.latent_height, self.latent_width):
+            raise ValueError(
+                f'Expected visual latent spatial shape ({self.latent_height}, {self.latent_width}) '
+                f'(img_size={self.latent_height * 8}x{self.latent_width * 8}), '
+                f'got {tuple(z_vis.shape[-2:])}.'
+            )
         t_len = z_vis.size(1)
         vis_tokens = self.patch_embed(self._patchify(z_vis))  # (B, T, N_patches, D)
 
